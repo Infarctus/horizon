@@ -62,7 +62,6 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: "0"
-  RUSTC_BOOTSTRAP: "1"
 
 jobs:
   scope:
@@ -197,6 +196,11 @@ jobs:
           filter: blob:none
           persist-credentials: false
 
+      - name: Set up Python 3.12
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
       - name: Fetch upstream base ref
         env:
           INPUT_BASE: ${{ inputs.base }}
@@ -240,9 +244,9 @@ jobs:
           fi
 
           if [ -f tools/ci/unittest_parallel.py ]; then
-            python3 tools/ci/unittest_parallel.py
+            env -u GITHUB_REPOSITORY python3 tools/ci/unittest_parallel.py
           else
-            python3 -m unittest discover -s tests
+            env -u GITHUB_REPOSITORY python3 -m unittest discover -s tests
           fi
 
   pr-ready:
@@ -274,6 +278,11 @@ jobs:
           git remote remove upstream 2>/dev/null || true
           git remote add upstream https://github.com/horizon-rust/horizon.git
           git fetch --no-tags --filter=blob:none upstream "refs/heads/${INPUT_BASE}:refs/remotes/upstream/${INPUT_BASE}"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
 
       - name: Install Rust toolchain and Linux build dependencies
         env:
@@ -327,7 +336,7 @@ jobs:
           raw_out="$RUNNER_TEMP/pr-ready-raw.md"
           summary_out="$RUNNER_TEMP/pr-ready-summary.md"
           status=0
-          python3 tools/pr_ready.py --base "$BASE_REF" >"$raw_out" || status=$?
+          env -u GITHUB_REPOSITORY python3 tools/pr_ready.py --base "$BASE_REF" >"$raw_out" || status=$?
 
           python3 - "$raw_out" "$summary_out" <<'PY'
           import re
@@ -576,6 +585,8 @@ jobs:
 
       - name: Check, clippy, and test launcher
         working-directory: launcher
+        env:
+          RUSTC_BOOTSTRAP: "1"
         run: |
           set -euo pipefail
           cargo fmt -- --check
