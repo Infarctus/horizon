@@ -739,11 +739,11 @@ impl Game<'_> {
         if self.remote.is_some() {
             return;
         }
+        self.exec = ExecState::default();
         let now = self.world.game_time;
         if !self.fns.schedule.has_due(now) {
             return;
         }
-        self.exec = ExecState::default();
         let source = self.server_source();
         while let Some(id) = self.fns.schedule.pop_due(now) {
             match id.strip_prefix('#') {
