@@ -38,3 +38,8 @@ horizon_client_render::ui::draw_sprite  #13220
 horizon_client_render::ui::nine_slice_metadata  #13220
 horizon_client::game::interactions::Game<'_>::interaction_hit  #15412
 horizon_client_render::font::TrueType::ids  kind=field  #20187
+horizon_client::game::functions::FnState::next_seq  kind=field  #20401
+horizon_client::game::functions::Scheduled  kind=struct  #20401
+horizon_client::game::functions::Scheduled::id  kind=field  #20401
+horizon_client::game::functions::Scheduled::seq  kind=field  #20401
+horizon_client::game::functions::Scheduled::time  kind=field  #20401
