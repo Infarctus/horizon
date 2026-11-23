@@ -1,0 +1,436 @@
+name: Fork PR Checks
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or commit SHA on this fork to check
+        required: true
+        type: string
+      base:
+        description: Upstream branch on horizon-rust/horizon to diff against
+        required: false
+        default: main
+        type: string
+      mode:
+        description: Check suite to run (pr-ready, quick, or full)
+        required: false
+        default: pr-ready
+        type: choice
+        options:
+          - pr-ready
+          - quick
+          - full
+      crates:
+        description: Optional space-separated crate names (e.g. horizon-client-lib horizon-world)
+        required: false
+        default: ""
+        type: string
+      test_filter:
+        description: Optional cargo test filter (used in quick mode or as an extra step in full mode)
+        required: false
+        default: ""
+        type: string
+      run_ignored:
+        description: Pass -- --ignored to targeted test_filter runs (requires test_filter; no vanilla .local/ data)
+        required: false
+        default: false
+        type: boolean
+      run_mod_api:
+        description: Force tools/check_mod_api_unchanged.py --allow-added (auto-runs in full mode when mod API is touched)
+        required: false
+        default: false
+        type: boolean
+      build_fast:
+        description: In full mode, also run cargo build --locked --profile fast -p horizon-game
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-pr-checks-${{ inputs.ref }}-${{ inputs.mode }}
+  cancel-in-progress: true
+
+env:
+  HORIZON_TELEMETRY_URL: "off"
+  HORIZON_NO_AUDIO: "1"
+  WGPU_BACKEND: "dx12"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  RUSTC_BOOTSTRAP: "1"
+
+jobs:
+  checks:
+    name: "Fork CI (${{ inputs.mode }} @ ${{ inputs.ref }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Validate inputs and prepare scratch environment
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_BASE: ${{ inputs.base }}
+          INPUT_RUN_IGNORED: ${{ inputs.run_ignored }}
+          INPUT_TEST_FILTER: ${{ inputs.test_filter }}
+        run: |
+          set -euo pipefail
+          if [ "$INPUT_REF" = "fork-ci" ]; then
+            echo "::error::Cannot run checks against the fork-ci branch itself. Pass a feature branch or commit SHA."
+            exit 1
+          fi
+          if [[ ! "$INPUT_BASE" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "::error::Invalid base branch name: $INPUT_BASE"
+            exit 1
+          fi
+          if [ "$INPUT_RUN_IGNORED" = "true" ] && [ -z "$INPUT_TEST_FILTER" ]; then
+            echo "::error::run_ignored=true requires test_filter so data-backed daily tests are not run without vanilla resources."
+            exit 1
+          fi
+
+          scratch="$RUNNER_TEMP/horizon-scratch"
+          mkdir -p "$scratch/home" "$scratch/data" "$scratch/config"
+          {
+            echo "HORIZON_HOME=$scratch/home"
+            echo "XDG_DATA_HOME=$scratch/data"
+            echo "XDG_CONFIG_HOME=$scratch/config"
+          } >> "$GITHUB_ENV"
+
+      - name: Free disk space on ubuntu-latest
+        run: |
+          set -euo pipefail
+          echo "Disk before cleanup:"
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/.ghcup
+          echo "Disk after cleanup:"
+          df -h /
+
+      - name: Checkout target ref from fork
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Fetch upstream base ref and inspect scope
+        id: scope
+        env:
+          INPUT_BASE: ${{ inputs.base }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/horizon-rust/horizon.git
+          git fetch --no-tags --filter=blob:none upstream "refs/heads/${INPUT_BASE}:refs/remotes/upstream/${INPUT_BASE}"
+
+          BASE_REF="upstream/${INPUT_BASE}"
+          HEAD_SHA="$(git rev-parse HEAD)"
+          MERGE_BASE="$(git merge-base HEAD "$BASE_REF")"
+          {
+            echo "base_ref=$BASE_REF"
+            echo "head_sha=$HEAD_SHA"
+            echo "merge_base=$MERGE_BASE"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Checked out ref '${INPUT_REF}' at ${HEAD_SHA}"
+          echo "Comparing against ${BASE_REF} (merge base ${MERGE_BASE})"
+
+          rust_needed=true
+          launcher_needed=false
+          mod_api_needed=false
+          if [ -f tools/ci/rust_changes.py ]; then
+            rust_out="$(python3 tools/ci/rust_changes.py "$MERGE_BASE" "$HEAD_SHA" || true)"
+            launcher_out="$(python3 tools/ci/rust_changes.py --launcher "$MERGE_BASE" "$HEAD_SHA" || true)"
+            rust_needed="$(printf '%s\n' "$rust_out" | awk -F= '$1=="required"{print $2}' | tail -n1)"
+            mod_api_needed="$(printf '%s\n' "$rust_out" | awk -F= '$1=="mod_api"{print $2}' | tail -n1)"
+            launcher_needed="$(printf '%s\n' "$launcher_out" | awk -F= '$1=="required"{print $2}' | tail -n1)"
+          fi
+          rust_needed="${rust_needed:-true}"
+          launcher_needed="${launcher_needed:-false}"
+          mod_api_needed="${mod_api_needed:-false}"
+
+          {
+            echo "rust=$rust_needed"
+            echo "launcher=$launcher_needed"
+            echo "mod_api=$mod_api_needed"
+          } >> "$GITHUB_OUTPUT"
+          echo "Scope: rust=$rust_needed launcher=$launcher_needed mod_api=$mod_api_needed"
+
+      - name: Install Rust toolchain and Linux build dependencies
+        env:
+          NEED_LAUNCHER: ${{ steps.scope.outputs.launcher }}
+        run: |
+          set -euo pipefail
+          apt_pkgs=(libasound2-dev libudev-dev pkg-config mold)
+          if [ "$NEED_LAUNCHER" = "true" ]; then
+            apt_pkgs+=(libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libfontconfig-dev libvulkan-dev)
+          fi
+
+          if [ -f tools/ci/install_rust.sh ]; then
+            HOSTED=true bash tools/ci/install_rust.sh "${apt_pkgs[@]}"
+            rustup default stable
+          else
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends -o Dpkg::Use-Pty=false "${apt_pkgs[@]}"
+            rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+            rustup default stable
+          fi
+
+          rustc --version
+          cargo --version
+          # Use mold and cap compiler frontend threads to 4 on 4-vCPU / 16 GB ubuntu-latest runners.
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold -Zthreads=4" >> "$GITHUB_ENV"
+
+      - name: Cache Cargo registry and build dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: fork-pr-checks-v1
+          cache-on-failure: false
+          save-if: ${{ inputs.mode != 'quick' && steps.scope.outputs.rust == 'true' }}
+
+      - name: Cache launcher workspace dependencies
+        if: steps.scope.outputs.launcher == 'true'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: launcher
+          shared-key: fork-pr-checks-launcher-v1
+          cache-on-failure: false
+          save-if: ${{ inputs.mode != 'quick' && steps.scope.outputs.launcher == 'true' }}
+
+      - name: Run tools/pr_ready.py
+        if: inputs.mode == 'pr-ready' || inputs.mode == 'full'
+        id: pr_ready
+        env:
+          BASE_REF: ${{ steps.scope.outputs.base_ref }}
+          MERGE_BASE: ${{ steps.scope.outputs.merge_base }}
+        run: |
+          set -euo pipefail
+          raw_out="$RUNNER_TEMP/pr-ready-raw.md"
+          summary_out="$RUNNER_TEMP/pr-ready-summary.md"
+          status=0
+          python3 tools/pr_ready.py --base "$BASE_REF" >"$raw_out" || status=$?
+
+          # Scrub runner hostname so the Markdown block is ready to paste into an upstream PR.
+          python3 - "$raw_out" "$summary_out" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          text = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+          text = re.sub(r"host `[^`]+`", "host `ci`", text)
+          Path(sys.argv[2]).write_text(text, encoding="utf-8")
+          PY
+          rm -f "$raw_out"
+
+          {
+            echo "## Self-check"
+            echo ""
+            cat "$summary_out"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "=== Ready-to-paste PR Self-check block ==="
+          cat "$summary_out"
+
+          if [ "$status" -eq 0 ] && [ -f tools/ci/nested_locks.py ]; then
+            python3 tools/ci/nested_locks.py --base "$MERGE_BASE" || status=$?
+          fi
+          exit "$status"
+
+      - name: Upload pr_ready summary artifact
+        if: always() && (inputs.mode == 'pr-ready' || inputs.mode == 'full')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pr-ready-summary
+          path: ${{ runner.temp }}/pr-ready-summary.md
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Run quick checks
+        if: inputs.mode == 'quick'
+        env:
+          BASE_REF: ${{ steps.scope.outputs.base_ref }}
+          MERGE_BASE: ${{ steps.scope.outputs.merge_base }}
+          INPUT_CRATES: ${{ inputs.crates }}
+          INPUT_TEST_FILTER: ${{ inputs.test_filter }}
+          INPUT_RUN_IGNORED: ${{ inputs.run_ignored }}
+        run: |
+          set -euo pipefail
+          python3 tools/check_public_tree.py
+          python3 tools/check_layers.py --base "$BASE_REF"
+          python3 tools/check_addresses.py --base "$BASE_REF"
+          if [ -f tools/ci/nested_locks.py ]; then
+            python3 tools/ci/nested_locks.py --base "$MERGE_BASE"
+          fi
+
+          mapfile -t changed_root_rs < <(git diff --name-only --diff-filter=ACMR "$MERGE_BASE"...HEAD -- '*.rs' ':!launcher/**')
+          existing_root_rs=()
+          for f in "${changed_root_rs[@]}"; do
+            [ -f "$f" ] && existing_root_rs+=("$f")
+          done
+          if [ "${#existing_root_rs[@]}" -gt 0 ]; then
+            echo "Checking rustfmt (edition 2024) on ${#existing_root_rs[@]} changed Rust file(s)..."
+            rustfmt --edition 2024 --check --config skip_children=true "${existing_root_rs[@]}"
+          fi
+
+          mapfile -t changed_launcher_rs < <(git diff --name-only --diff-filter=ACMR "$MERGE_BASE"...HEAD -- 'launcher/**/*.rs')
+          if [ "${#changed_launcher_rs[@]}" -gt 0 ]; then
+            echo "Checking launcher rustfmt..."
+            cargo fmt --manifest-path launcher/Cargo.toml -- --check
+          fi
+
+          crate_args=()
+          has_mod_package=false
+          if [ -n "$INPUT_CRATES" ]; then
+            for c in $INPUT_CRATES; do
+              if [[ ! "$c" =~ ^[A-Za-z0-9_-]+$ ]]; then
+                echo "::error::Invalid crate name: $c"
+                exit 1
+              fi
+              if [ "$c" = "horizon-mod-package" ]; then
+                has_mod_package=true
+              fi
+              crate_args+=(-p "$c")
+            done
+          else
+            detected="$(python3 - "$BASE_REF" <<'PY'
+          import sys
+          sys.path.insert(0, ".")
+          from tools import parity, pr_ready
+
+          changed = parity.changed_files(sys.argv[1]) or []
+          if not any(pr_ready.workspace_rust(p) for p in changed):
+              print("__NONE__")
+              sys.exit(0)
+          crates_of, _, _ = pr_ready.packages()
+          crates = pr_ready.touched_crates(changed, crates_of)
+          if crates is None:
+              print("__WORKSPACE__")
+          elif not crates:
+              print("__NONE__")
+          else:
+              print(" ".join(crates))
+          PY
+          )"
+            if [ "$detected" = "__NONE__" ]; then
+              echo "No root-workspace Rust files changed; skipping cargo check/test."
+              {
+                echo "## Quick check"
+                echo ""
+                echo "- Base: \`${BASE_REF}\` (merge base \`${MERGE_BASE:0:9}\`)"
+                echo "- Public tree, layers, addresses, nested locks: passed"
+                echo "- Root Rust workspace: untouched (skipped)"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            elif [ "$detected" = "__WORKSPACE__" ]; then
+              crate_args=(--workspace)
+              has_mod_package=true
+            else
+              for c in $detected; do
+                if [ "$c" = "horizon-mod-package" ]; then
+                  has_mod_package=true
+                fi
+                crate_args+=(-p "$c")
+              done
+            fi
+          fi
+
+          if [ "$has_mod_package" = "true" ]; then
+            echo "Building horizon-mod-package holder_actor example prerequisite..."
+            cargo build --locked -p horizon-mod-package --features runtime-process --example holder_actor
+          fi
+
+          echo "Running cargo check --locked ${crate_args[*]} --all-targets"
+          cargo check --locked "${crate_args[@]}" --all-targets
+
+          test_cmd=(cargo test --locked "${crate_args[@]}" --lib --bins --tests)
+          if [ "$has_mod_package" = "true" ]; then
+            test_cmd+=(--features horizon-mod-package/index)
+          fi
+          if [ -n "$INPUT_TEST_FILTER" ]; then
+            test_cmd+=("$INPUT_TEST_FILTER")
+          fi
+          if [ "$INPUT_RUN_IGNORED" = "true" ]; then
+            test_cmd+=(-- --ignored)
+          fi
+          echo "Running ${test_cmd[*]}"
+          "${test_cmd[@]}"
+
+          {
+            echo "## Quick check"
+            echo ""
+            echo "- Base: \`${BASE_REF}\` (merge base \`${MERGE_BASE:0:9}\`)"
+            echo "- Selection: \`${crate_args[*]}\`"
+            if [ -n "$INPUT_TEST_FILTER" ]; then
+              echo "- Test filter: \`${INPUT_TEST_FILTER}\` (ignored=${INPUT_RUN_IGNORED})"
+            fi
+            echo "- Status: passed"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run mod API check
+        if: inputs.run_mod_api || (inputs.mode == 'full' && steps.scope.outputs.mod_api == 'true')
+        env:
+          BASE_REF: ${{ steps.scope.outputs.base_ref }}
+          MERGE_BASE: ${{ steps.scope.outputs.merge_base }}
+        run: |
+          set -euo pipefail
+          # Always clean up the separate base worktree build folder so rust-cache stays under GitHub's 10 GB limit.
+          trap 'rm -rf "${CARGO_TARGET_DIR:-target}/mod-api-base"' EXIT
+          python3 tools/check_mod_api_unchanged.py --base "$MERGE_BASE" --allow-added
+          {
+            echo "## Mod API check"
+            echo ""
+            echo "- \`tools/check_mod_api_unchanged.py --base ${MERGE_BASE:0:12} --allow-added\` (merge base with \`${BASE_REF}\`): passed"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run extra targeted cargo tests (full mode)
+        if: inputs.mode == 'full' && (inputs.test_filter != '' || inputs.crates != '')
+        env:
+          INPUT_CRATES: ${{ inputs.crates }}
+          INPUT_TEST_FILTER: ${{ inputs.test_filter }}
+          INPUT_RUN_IGNORED: ${{ inputs.run_ignored }}
+        run: |
+          set -euo pipefail
+          crate_args=()
+          has_mod_package=false
+          if [ -n "$INPUT_CRATES" ]; then
+            for c in $INPUT_CRATES; do
+              if [[ ! "$c" =~ ^[A-Za-z0-9_-]+$ ]]; then
+                echo "::error::Invalid crate name: $c"
+                exit 1
+              fi
+              if [ "$c" = "horizon-mod-package" ]; then
+                has_mod_package=true
+              fi
+              crate_args+=(-p "$c")
+            done
+          else
+            crate_args=(--workspace)
+            has_mod_package=true
+          fi
+          if [ "$has_mod_package" = "true" ]; then
+            cargo build --locked -p horizon-mod-package --features runtime-process --example holder_actor
+          fi
+          test_cmd=(cargo test --locked "${crate_args[@]}" --lib --bins --tests)
+          if [ "$has_mod_package" = "true" ]; then
+            test_cmd+=(--features horizon-mod-package/index)
+          fi
+          if [ -n "$INPUT_TEST_FILTER" ]; then
+            test_cmd+=("$INPUT_TEST_FILTER")
+          fi
+          if [ "$INPUT_RUN_IGNORED" = "true" ]; then
+            test_cmd+=(-- --ignored)
+          fi
+          echo "Running ${test_cmd[*]}"
+          "${test_cmd[@]}"
+
+      - name: Build horizon-game with --profile fast (full mode)
+        if: inputs.mode == 'full' && inputs.build_fast
+        run: |
+          set -euo pipefail
+          # Always remove release-profile artifacts before rust-cache save so debug/clippy cache stays under 10 GB.
+          trap 'rm -rf "${CARGO_TARGET_DIR:-target}/fast"' EXIT
+          cargo build --locked --profile fast -p horizon-game
