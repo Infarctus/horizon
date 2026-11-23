@@ -46,7 +46,7 @@ impl ItemEntity {
         &mut self,
         world: &mut W,
         facts: &BlockFacts,
-        registry: &horizon_world::registry::BlockRegistry,
+        _registry: &horizon_world::registry::BlockRegistry,
         can_be_hurt_by: &dyn Fn(&ItemStack, &str) -> bool,
         in_rain: bool,
         mut invulnerable: impl FnMut(&mut W, &str) -> bool,
@@ -63,11 +63,26 @@ impl ItemEntity {
         let was_on_fire = self.fire_ticks > 0;
         let blocks_apply = self.health > 0;
         let mut lava_hurt = false;
+        let bounds = self.bounds();
+        // Pre-query the section hazard mask once with the wider `1e-5_f32` inset so one
+        // cached palette read gates lava cauldron, fire, and cactus checks together.
+        // If an `invulnerable` hook runs, fall back to re-checking in case it mutates `world`.
+        use crate::blocks::hazard;
+        let epsilon = f64::from(1e-5_f32);
+        let box_hazards = crate::motion::environment::closed_cell_bounds(
+            bounds.deflate(Vec3::new(epsilon, epsilon, epsilon)),
+        )
+        .map_or(0, |(lo, hi)| world.hazard_mask(lo, hi, facts));
+        let mut world_touched = false;
         // LavaCauldronBlock.entityInside applies LAVA_IGNITE and then lavaHurt.
         // A cauldron is not a lava fluid, and removed items get no block effects.
         if self.health > 0 && !fire_immune {
-            let contacts = usize::from(fluid == Fluid::Lava)
-                + lava_cauldron_contacts(world, registry, self.bounds());
+            let cauldrons = if box_hazards & hazard::LAVA_CAULDRON != 0 {
+                lava_cauldron_contacts(world, facts, bounds)
+            } else {
+                0
+            };
+            let contacts = usize::from(fluid == Fluid::Lava) + cauldrons;
             if contacts > 0 {
                 self.fire_ticks = self.fire_ticks.max(300);
             }
@@ -76,26 +91,31 @@ impl ItemEntity {
                 if self.health <= 0 {
                     break;
                 }
-                if can_be_hurt_by(&self.stack, "minecraft:lava")
-                    && !invulnerable(world, "minecraft:lava")
-                {
-                    hits.hit(self, 4);
-                    lava_hurt = true;
+                if can_be_hurt_by(&self.stack, "minecraft:lava") {
+                    world_touched = true;
+                    if !invulnerable(world, "minecraft:lava") {
+                        hits.hit(self, 4);
+                        lava_hurt = true;
+                    }
                 }
             }
         }
-        let fire_damage = crate::motion::environment::fire_contact(world, registry, self.bounds());
-        if fire_damage > 0.0 && !fire_immune {
-            self.fire_ticks = self.fire_ticks.max(160);
-            if can_be_hurt_by(&self.stack, "minecraft:in_fire")
-                && !invulnerable(world, "minecraft:in_fire")
-            {
-                hits.hit(self, fire_damage as i32);
+        if !fire_immune && (world_touched || box_hazards & hazard::ANY_FIRE != 0) {
+            let fire_damage = crate::motion::environment::fire_contact(world, facts, bounds);
+            if fire_damage > 0.0 {
+                self.fire_ticks = self.fire_ticks.max(160);
+                if can_be_hurt_by(&self.stack, "minecraft:in_fire") {
+                    world_touched = true;
+                    if !invulnerable(world, "minecraft:in_fire") {
+                        hits.hit(self, fire_damage as i32);
+                    }
+                }
             }
         }
         // CactusBlock.entityInside: `entity.hurt(cactus, 1.0)`, a point a tick
         // (an item has no hurt cooldown), unless `canBeHurtBy` skips it.
-        if crate::motion::environment::cactus_contact(world, registry, self.bounds())
+        if (world_touched || box_hazards & hazard::CACTUS != 0)
+            && crate::motion::environment::cactus_contact(world, facts, bounds)
             && can_be_hurt_by(&self.stack, "minecraft:cactus")
             && !invulnerable(world, "minecraft:cactus")
         {

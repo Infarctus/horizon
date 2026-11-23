@@ -196,6 +196,8 @@ pub(super) mod tests {
             let collision = BlockCollisionRegistry::new(std::sync::Arc::new(cached)).unwrap();
             let facts = BlockFacts {
                 states: vec![],
+                hazards: vec![],
+                hazard_tag: 0,
                 air: BlockStateId(0),
                 woods: HashMap::new(),
                 sign_texts: HashMap::new(),

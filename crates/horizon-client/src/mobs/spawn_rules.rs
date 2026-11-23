@@ -896,6 +896,8 @@ mod mod_spawn_rule_tests {
                     state("minecraft:grass_block", true),
                     state("minecraft:stone", true),
                 ],
+                hazards: vec![crate::blocks::hazard::AIR, 0, 0],
+                hazard_tag: 0,
                 air: AIR,
                 woods: Default::default(),
                 sign_texts: Default::default(),

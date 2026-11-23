@@ -733,36 +733,98 @@ impl World {
     /// the sections it reaches (a palette of the whole registry may hold
     /// anything): `false` means [`Self::block`] matches in none of its cells,
     /// so a scan over them can stop before reading one.
+    #[inline]
     pub fn may_hold(
         &self,
         lo: [i32; 3],
         hi: [i32; 3],
         mut matches: impl FnMut(BlockStateId) -> bool,
     ) -> bool {
-        let layout = self.layout();
-        let (bottom, top) = (layout.min_y(), layout.max_y() - 1);
-        // Heights outside the sections read as state 0.
-        if (lo[1] < bottom || hi[1] > top) && matches(BlockStateId(0)) {
+        if lo[0] > hi[0] || lo[1] > hi[1] || lo[2] > hi[2] {
+            return false;
+        }
+        let (cx0, cx1) = (lo[0] >> 4, hi[0] >> 4);
+        let (cz0, cz1) = (lo[2] >> 4, hi[2] >> 4);
+        if cx0 == cx1 && cz0 == cz1 {
+            return match self.chunks.get_chunk(cx0, cz0) {
+                Some(chunk) => chunk_may_hold(chunk, lo[1], hi[1], &mut matches),
+                None => matches(self.air),
+            };
+        }
+        // Cap the palette scan on huge swept boxes (e.g. unsnapped teleports):
+        // returning `true` conservatively lets the caller's budgeted walk run.
+        let chunk_span_x = i64::from(cx1) - i64::from(cx0) + 1;
+        let chunk_span_z = i64::from(cz1) - i64::from(cz0) + 1;
+        if chunk_span_x.saturating_mul(chunk_span_z) > 64 {
             return true;
         }
-        let sections = (lo[1].max(bottom) - bottom) >> 4..=(hi[1].min(top) - bottom) >> 4;
-        for cx in lo[0] >> 4..=hi[0] >> 4 {
-            for cz in lo[2] >> 4..=hi[2] >> 4 {
-                let Some(chunk) = self.chunks.get_chunk(cx, cz) else {
-                    if matches(self.air) {
-                        return true;
-                    }
-                    continue;
+        for cx in cx0..=cx1 {
+            for cz in cz0..=cz1 {
+                let matched = match self.chunks.get_chunk(cx, cz) {
+                    Some(chunk) => chunk_may_hold(chunk, lo[1], hi[1], &mut matches),
+                    None => matches(self.air),
                 };
-                for s in sections.clone() {
-                    let blocks = &chunk.sections[s as usize].blocks;
-                    if blocks.is_global() || blocks.maybe_has(|v| matches(BlockStateId(v))) {
-                        return true;
-                    }
+                if matched {
+                    return true;
                 }
             }
         }
         false
+    }
+    /// Conservative union of [`crate::blocks::hazard`] bits across the palettes
+    /// of the sections `lo..=hi` reaches. Each list-palette section caches its
+    /// mask in place keyed by `facts.hazard_tag`, turning repeated per-entity
+    /// hazard checks into a single atomic load.
+    #[inline]
+    pub fn hazard_mask(
+        &self,
+        lo: [i32; 3],
+        hi: [i32; 3],
+        facts: &crate::blocks::BlockFacts,
+    ) -> u32 {
+        if lo[0] > hi[0] || lo[1] > hi[1] || lo[2] > hi[2] {
+            return 0;
+        }
+        let (cx0, cx1) = (lo[0] >> 4, hi[0] >> 4);
+        let (cz0, cz1) = (lo[2] >> 4, hi[2] >> 4);
+        if cx0 == cx1 && cz0 == cz1 {
+            return match self.chunks.get_chunk(cx0, cz0) {
+                Some(chunk) => chunk_hazard_mask(chunk, lo[1], hi[1], facts),
+                None => facts.hazards(self.air),
+            };
+        }
+        // Cap the palette scan on huge swept boxes (e.g. unsnapped teleports):
+        // returning `u32::MAX` conservatively lets the caller's budgeted walk run.
+        let chunk_span_x = i64::from(cx1) - i64::from(cx0) + 1;
+        let chunk_span_z = i64::from(cz1) - i64::from(cz0) + 1;
+        if chunk_span_x.saturating_mul(chunk_span_z) > 64 {
+            return u32::MAX;
+        }
+        let mut mask = 0u32;
+        for cx in cx0..=cx1 {
+            for cz in cz0..=cz1 {
+                mask |= match self.chunks.get_chunk(cx, cz) {
+                    Some(chunk) => chunk_hazard_mask(chunk, lo[1], hi[1], facts),
+                    None => facts.hazards(self.air),
+                };
+                if mask == u32::MAX {
+                    return u32::MAX;
+                }
+            }
+        }
+        mask
+    }
+    /// Whether any section `lo..=hi` reaches may hold a state carrying a bit in
+    /// `wanted` (`crate::blocks::hazard::*`).
+    #[inline]
+    pub fn may_hold_hazard(
+        &self,
+        lo: [i32; 3],
+        hi: [i32; 3],
+        facts: &crate::blocks::BlockFacts,
+        wanted: u32,
+    ) -> bool {
+        self.hazard_mask(lo, hi, facts) & wanted != 0
     }
     /// The block entities to tick this tick, in order (`BlockEntities::tickers`).
     pub fn block_entity_tickers(
@@ -1231,6 +1293,26 @@ mod tests {
         // Past the top, and the palette of air below it.
         assert!(!world.may_hold([0, 400, 0], [0, 401, 0], nine));
         assert!(world.may_hold([0, 400, 0], [0, 401, 0], |s| s.0 == 0));
+        // Extreme heights do not overflow; oversized spans fail open conservatively.
+        assert!(!world.may_hold([0, i32::MAX - 1, 0], [0, i32::MAX, 0], nine));
+        assert!(world.may_hold([0, 64, 0], [1000, 65, 1000], nine));
+        // Cached hazard_mask tracks section palettes and updates on writes.
+        use crate::blocks::hazard;
+        let mut hazards = vec![0u32; 10];
+        hazards[0] = hazard::AIR;
+        hazards[9] = hazard::CACTUS;
+        let facts = crate::blocks::BlockFacts {
+            states: Vec::new(),
+            hazards,
+            hazard_tag: 1,
+            air: BlockStateId(0),
+            woods: Default::default(),
+            sign_texts: Default::default(),
+        };
+        assert!(world.may_hold_hazard([0, 64, 0], [1, 65, 1], &facts, hazard::CACTUS));
+        assert!(!world.may_hold_hazard([0, 64, 0], [1, 65, 1], &facts, hazard::ANY_FIRE));
+        assert!(!world.may_hold_hazard([0, 50, 0], [15, 63, 15], &facts, hazard::CACTUS));
+        assert!(world.may_hold_hazard([0, 64, 0], [1000, 65, 1000], &facts, hazard::ANY_FIRE));
     }
 }
 
@@ -1239,6 +1321,78 @@ mod tests {
 pub struct BlockEntityExtras {
     pub source: Option<horizon_core::nbt::Tag>,
     pub pending_loot: Option<crate::chunk::PendingContainerLoot>,
+}
+
+#[inline(always)]
+fn chunk_may_hold(
+    chunk: &Chunk,
+    lo_y: i32,
+    hi_y: i32,
+    matches: &mut impl FnMut(BlockStateId) -> bool,
+) -> bool {
+    let bottom = chunk.min_y();
+    let max_y = chunk.max_y();
+    if chunk.sections.is_empty() || hi_y < bottom || lo_y >= max_y {
+        return matches(BlockStateId(0));
+    }
+    let top = max_y - 1;
+    if (lo_y < bottom || hi_y > top) && matches(BlockStateId(0)) {
+        return true;
+    }
+    let s0 = ((lo_y.max(bottom) - bottom) >> 4) as usize;
+    let s1 = ((hi_y.min(top) - bottom) >> 4) as usize;
+    if s0 == s1 {
+        return chunk.sections[s0]
+            .blocks
+            .maybe_has_or_global(|v| matches(BlockStateId(v)));
+    }
+    for s in s0..=s1 {
+        if chunk.sections[s]
+            .blocks
+            .maybe_has_or_global(|v| matches(BlockStateId(v)))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[inline(always)]
+fn chunk_hazard_mask(
+    chunk: &Chunk,
+    lo_y: i32,
+    hi_y: i32,
+    facts: &crate::blocks::BlockFacts,
+) -> u32 {
+    let bottom = chunk.min_y();
+    let max_y = chunk.max_y();
+    if chunk.sections.is_empty() || hi_y < bottom || lo_y >= max_y {
+        return facts.hazards(BlockStateId(0));
+    }
+    let top = max_y - 1;
+    let mut mask = if lo_y < bottom || hi_y > top {
+        facts.hazards(BlockStateId(0))
+    } else {
+        0
+    };
+    let s0 = ((lo_y.max(bottom) - bottom) >> 4) as usize;
+    let s1 = ((hi_y.min(top) - bottom) >> 4) as usize;
+    let tag = facts.hazard_tag;
+    if s0 == s1 {
+        return mask
+            | chunk.sections[s0]
+                .blocks
+                .palette_mask(tag, |v| facts.hazards(BlockStateId(v)));
+    }
+    for s in s0..=s1 {
+        mask |= chunk.sections[s]
+            .blocks
+            .palette_mask(tag, |v| facts.hazards(BlockStateId(v)));
+        if mask == u32::MAX {
+            return u32::MAX;
+        }
+    }
+    mask
 }
 
 #[cfg(test)]

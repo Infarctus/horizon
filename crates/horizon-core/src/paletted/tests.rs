@@ -455,6 +455,7 @@ fn index_check_matches_an_entry_by_entry_scan() {
             words: words.to_vec(),
             identity: Identity::default(),
             saved_nbt: OnceLock::new(),
+            mask_cache: PaletteMaskCache::default(),
         };
         match (container.check_indices(), scan(strategy, bits, len, words)) {
             (Ok(()), Ok(())) => {}
@@ -570,6 +571,7 @@ fn saved_validation_matches_entrywise_reference() {
                 words: data.to_vec(),
                 identity: Identity::default(),
                 saved_nbt: OnceLock::new(),
+                mask_cache: PaletteMaskCache::default(),
             },
             _ => PalettedContainer::build(strategy, palette, &ids),
         })
@@ -879,6 +881,7 @@ fn global_uniform(value: u32) -> PalettedContainer {
         words: vec![pattern; BLOCKS.entries().div_ceil(per)],
         identity: Identity::default(),
         saved_nbt: OnceLock::new(),
+        mask_cache: PaletteMaskCache::default(),
     }
 }
 /// Sections saved from a column: one value (a single palette, and a list
@@ -1151,4 +1154,49 @@ fn benchmark_pack_and_unpack_widths() {
             median(&times[0]) / median(&times[1])
         );
     }
+}
+
+#[test]
+fn palette_mask_caches_list_palettes_and_invalidates_on_growth() {
+    let mask_of = |v: u32| 1u32 << (v % 31);
+    let mut c = PalettedContainer::new(BLOCKS, 1);
+    assert_eq!(c.palette_mask(7, mask_of), mask_of(1));
+
+    // Growing from Single to List computes and caches for tag 7.
+    c.set(0, 2);
+    let mut calls = 0usize;
+    let first = c.palette_mask(7, |v| {
+        calls += 1;
+        mask_of(v)
+    });
+    assert_eq!(first, mask_of(1) | mask_of(2));
+    assert_eq!(calls, 2);
+    let second = c.palette_mask(7, |_| {
+        calls += 1;
+        0
+    });
+    assert_eq!(second, first);
+    assert_eq!(calls, 2, "cached tag should not re-scan the palette");
+
+    // A different tag recomputes; tag 0 bypasses caching.
+    assert_eq!(c.palette_mask(8, |v| mask_of(v) << 1), first << 1);
+    assert_eq!(c.palette_mask(0, mask_of), first);
+
+    // Adding a new palette entry invalidates the cached mask.
+    c.set(1, 5);
+    assert_eq!(c.palette_mask(7, mask_of), first | mask_of(5));
+
+    // Resizing past 4 bits (16 entries) invalidates as well.
+    for i in 0..20u32 {
+        c.set(i as usize, i);
+    }
+    let expected = (0..20u32).fold(0u32, |acc, v| acc | mask_of(v));
+    assert_eq!(c.palette_mask(7, mask_of), expected);
+
+    // Global palette conservatively returns u32::MAX without invoking mask_of.
+    let global = global_uniform(1);
+    assert_eq!(
+        global.palette_mask(7, |_| panic!("should not scan global")),
+        u32::MAX
+    );
 }

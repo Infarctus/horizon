@@ -522,6 +522,8 @@ mod tests {
         };
         let facts = BlockFacts {
             states: Vec::new(),
+            hazards: Vec::new(),
+            hazard_tag: 0,
             air: horizon_world::registry::BlockStateId(0),
             woods: Default::default(),
             sign_texts: Default::default(),
@@ -611,6 +613,8 @@ mod tests {
         };
         let facts = BlockFacts {
             states: Vec::new(),
+            hazards: Vec::new(),
+            hazard_tag: 0,
             air: horizon_world::registry::BlockStateId(0),
             woods: Default::default(),
             sign_texts: Default::default(),

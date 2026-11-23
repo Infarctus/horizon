@@ -55,6 +55,13 @@ pub trait InsideWalk {
     fn block(&self, at: BlockPos) -> BlockStateId;
     /// `state.isAir()`, read as the sweep visits.
     fn is_air(&self, state: BlockStateId) -> bool;
+    /// Whether the sweep can drop `state` without recording a hit. Defaults to [`Self::is_air`].
+    /// Walks with no active fluid checks or block hooks can skip states that have no inside
+    /// behaviour, avoiding hit buffering and visited tracking for harmless terrain.
+    #[inline]
+    fn skips_block(&self, state: BlockStateId) -> bool {
+        self.is_air(state)
+    }
     /// `state.getEntityInsideCollisionShape(level, pos, this)` for the walk.
     fn inside_shape(&mut self, state: BlockStateId, at: BlockPos) -> InsideShape;
     /// `collidedWithFluid(state.getFluidState(), pos, from, to)`.
@@ -87,6 +94,137 @@ pub trait InsideWalk {
     }
 }
 
+/// Stack-backed visited-cell set for [`sweep_inside_blocks`] / [`sweep_movements`].
+/// Starts empty (no 128-byte zero-fill when a sweep hits nothing), stores up to
+/// [`Self::INLINE`] packed block positions inline, and spills to an `FxHashSet<i64>`
+/// for long or wide sweeps.
+#[derive(Default)]
+pub enum VisitedCells {
+    #[default]
+    Empty,
+    Inline {
+        len: u8,
+        cells: [i64; Self::INLINE],
+    },
+    Spilled(crate::fast_hash::FxHashSet<i64>),
+}
+
+impl VisitedCells {
+    const INLINE: usize = 16;
+
+    #[inline]
+    pub fn new() -> Self {
+        Self::Empty
+    }
+
+    #[inline]
+    pub fn insert(&mut self, packed: i64) -> bool {
+        match self {
+            Self::Empty => {
+                let mut cells = [0; Self::INLINE];
+                cells[0] = packed;
+                *self = Self::Inline { len: 1, cells };
+                true
+            }
+            Self::Inline { len, cells } => {
+                let count = usize::from(*len);
+                if cells[..count].contains(&packed) {
+                    return false;
+                }
+                if count < Self::INLINE {
+                    cells[count] = packed;
+                    *len += 1;
+                    return true;
+                }
+                let mut set = crate::fast_hash::FxHashSet::with_capacity_and_hasher(
+                    Self::INLINE * 2,
+                    Default::default(),
+                );
+                set.extend(cells.iter().copied());
+                set.insert(packed);
+                *self = Self::Spilled(set);
+                true
+            }
+            Self::Spilled(set) => set.insert(packed),
+        }
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        match self {
+            Self::Empty => {}
+            Self::Inline { len, .. } => *len = 0,
+            Self::Spilled(set) => set.clear(),
+        }
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        match self {
+            Self::Empty | Self::Inline { .. } => Self::INLINE,
+            Self::Spilled(set) => set.capacity(),
+        }
+    }
+}
+
+/// Inline buffer for block hits collected during one [`sweep_inside_blocks`] call,
+/// avoiding both heap allocation and array zero-initialization for 0- or 1-hit sweeps.
+enum SweepHits {
+    Empty,
+    One((i32, BlockPos, BlockStateId)),
+    Inline {
+        len: u8,
+        items: [(i32, BlockPos, BlockStateId); Self::INLINE],
+    },
+    Spilled(Vec<(i32, BlockPos, BlockStateId)>),
+}
+
+impl SweepHits {
+    const INLINE: usize = 16;
+    const EMPTY: (i32, BlockPos, BlockStateId) = (0, BlockPos::new(0, 0, 0), BlockStateId(0));
+
+    #[inline]
+    fn new() -> Self {
+        Self::Empty
+    }
+
+    #[inline]
+    fn push(&mut self, hit: (i32, BlockPos, BlockStateId)) {
+        match self {
+            Self::Empty => *self = Self::One(hit),
+            Self::One(first) => {
+                let mut items = [Self::EMPTY; Self::INLINE];
+                items[0] = *first;
+                items[1] = hit;
+                *self = Self::Inline { len: 2, items };
+            }
+            Self::Inline { len, items } => {
+                let count = usize::from(*len);
+                if count < Self::INLINE {
+                    items[count] = hit;
+                    *len += 1;
+                } else {
+                    let mut vec = Vec::with_capacity(Self::INLINE * 2);
+                    vec.extend_from_slice(items);
+                    vec.push(hit);
+                    *self = Self::Spilled(vec);
+                }
+            }
+            Self::Spilled(vec) => vec.push(hit),
+        }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[(i32, BlockPos, BlockStateId)] {
+        match self {
+            Self::Empty => &[],
+            Self::One(hit) => std::slice::from_ref(hit),
+            Self::Inline { len, items } => &items[..usize::from(*len)],
+            Self::Spilled(vec) => vec.as_slice(),
+        }
+    }
+}
+
 /// `Entity.checkInsideBlocks(from, to, …)`: the blocks the box at `to` sweeps through
 /// from `from`, in the walk's order, each visited once, stopping when the entity dies
 /// or the iteration budget runs out. Returns the iterations used plus one. Air is
@@ -97,7 +235,7 @@ pub fn sweep_inside_blocks<W: InsideWalk>(
     walk: &mut W,
     from: horizon_core::geometry::Vec3,
     to: horizon_core::geometry::Vec3,
-    visited: &mut crate::fast_hash::FxHashSet<i64>,
+    visited: &mut VisitedCells,
     effects: &mut mod_api::InsideEffects,
     max_iterations: i32,
 ) -> Result<i32, W::Error> {
@@ -109,7 +247,7 @@ pub fn sweep_inside_blocks<W: InsideWalk>(
     let far = 0.999_990_000_000_252_6_f64;
     let moved_far = from.distance_squared(to) > far * far;
     let mut iterations = 0;
-    let mut hits: Vec<(i32, BlockPos, BlockStateId)> = Vec::new();
+    let mut hits = SweepHits::new();
     let _ = horizon_core::geometry::sweep_intersected_blocks(
         from,
         to,
@@ -121,13 +259,13 @@ pub fn sweep_inside_blocks<W: InsideWalk>(
             }
             iterations = iteration;
             let state = walk.block(p);
-            if !walk.is_air(state) {
+            if !walk.skips_block(state) {
                 hits.push((iteration, p, state));
             }
             true
         },
     );
-    for (step, p, state) in hits {
+    for &(step, p, state) in hits.as_slice() {
         let shape = walk.inside_shape(state, p);
         let inside_block = match shape {
             InsideShape::Full => true,
@@ -161,7 +299,7 @@ pub fn sweep_inside_blocks<W: InsideWalk>(
 pub fn sweep_movements<W: InsideWalk>(
     walk: &mut W,
     movements: &[horizon_world::entity_move::MovementRecord],
-    visited: &mut crate::fast_hash::FxHashSet<i64>,
+    visited: &mut VisitedCells,
     effects: &mut mod_api::InsideEffects,
 ) -> Result<(), W::Error> {
     for movement in movements {
@@ -624,7 +762,7 @@ mod tests {
     }
 
     fn walk(grid: &mut Grid, movements: &[horizon_world::entity_move::MovementRecord]) {
-        let mut visited = crate::fast_hash::FxHashSet::default();
+        let mut visited = super::VisitedCells::new();
         super::sweep_movements(grid, movements, &mut visited, &mut Default::default()).unwrap();
     }
 
@@ -673,7 +811,7 @@ mod tests {
             to: horizon_core::geometry::Vec3::new(1.5, 66.5, 2.5),
             original: Some(horizon_core::geometry::Vec3::new(0.0, 2.0, 1.0)),
         };
-        let mut visited = crate::fast_hash::FxHashSet::default();
+        let mut visited = super::VisitedCells::new();
         super::sweep_movements(&mut grid, &[record], &mut visited, &mut Default::default())
             .unwrap();
         assert_eq!(
@@ -786,5 +924,31 @@ mod tests {
                 .any(|&(_, p, _)| (16..20).contains(&p[0])),
             "nothing between the budget and the target is visited"
         );
+    }
+
+    /// Sweeping more than `VisitedCells::INLINE` / `SweepHits::INLINE` distinct non-air cells
+    /// spills seamlessly without dropping visits or duplicating blocks across movements.
+    #[test]
+    fn wide_sweep_spills_visited_and_hits_without_dropping_or_duplicating() {
+        let mut grid = Grid {
+            alive: true,
+            ..Grid::default()
+        };
+        for x in 1..=12 {
+            for y in 64..=65 {
+                grid.cell([x, y, 1], InsideShape::Full, false);
+            }
+        }
+        walk(
+            &mut grid,
+            &records([
+                ([0.5, 64.0, 1.5], [12.5, 64.0, 1.5]),
+                ([12.5, 64.0, 1.5], [0.5, 64.0, 1.5]),
+            ]),
+        );
+        assert_eq!(grid.visits.len(), 24);
+        let unique: std::collections::HashSet<[i32; 3]> =
+            grid.visits.iter().map(|&(_, p, _)| p).collect();
+        assert_eq!(unique.len(), 24);
     }
 }

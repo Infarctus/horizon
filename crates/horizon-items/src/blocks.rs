@@ -295,8 +295,96 @@ impl GameplayStateSource for GameplayProjection {
     }
 }
 
+/// Per-state bitmask flags for section-palette gating of entity hazard scans.
+pub mod hazard {
+    pub const AIR: u32 = 1 << 0;
+    pub const FIRE: u32 = 1 << 1;
+    pub const SOUL_FIRE: u32 = 1 << 2;
+    pub const ANY_FIRE: u32 = FIRE | SOUL_FIRE;
+    pub const LAVA_CAULDRON: u32 = 1 << 3;
+    pub const BUBBLE_COLUMN: u32 = 1 << 4;
+    pub const POWDER_SNOW: u32 = 1 << 5;
+    pub const CACTUS: u32 = 1 << 6;
+    pub const LIT_CAMPFIRE: u32 = 1 << 7;
+    pub const LIT_SOUL_CAMPFIRE: u32 = 1 << 8;
+    pub const COBWEB: u32 = 1 << 9;
+    pub const SWEET_BERRY_BUSH: u32 = 1 << 10;
+    pub const SWEET_BERRY_BUSH_PRICKLY: u32 = 1 << 11;
+    pub const HONEY_BLOCK: u32 = 1 << 12;
+    pub const WITHER_ROSE: u32 = 1 << 13;
+    pub const OPEN_EYEBLOSSOM: u32 = 1 << 14;
+    pub const LAVA: u32 = 1 << 15;
+    pub const WATER: u32 = 1 << 16;
+    pub const MODDED_FLUID: u32 = 1 << 17;
+
+    /// Water or lava fluid states (including waterlogged blocks, kelp, seagrass, bubble columns).
+    pub const WATER_OR_LAVA: u32 = WATER | LAVA;
+
+    /// Any non-empty fluid state (`StateFacts::fluid != Fluid::None`).
+    pub const ANY_FLUID: u32 = LAVA | WATER | MODDED_FLUID;
+
+    /// Vanilla blocks handled inside `MobInside::entity_inside`.
+    pub const MOB_INSIDE: u32 = POWDER_SNOW
+        | CACTUS
+        | LIT_CAMPFIRE
+        | LIT_SOUL_CAMPFIRE
+        | COBWEB
+        | SWEET_BERRY_BUSH
+        | HONEY_BLOCK;
+
+    /// Vanilla blocks handled by `ItemEntity::stuck_multiplier`.
+    pub const ITEM_STUCK: u32 = COBWEB | POWDER_SNOW;
+
+    /// Vanilla flowers handled by `flower_contact_effects`.
+    pub const FLOWERS: u32 = WITHER_ROSE | OPEN_EYEBLOSSOM;
+
+    /// Hazard bitmask for a block state from its name and relevant properties.
+    #[inline]
+    pub fn for_state(name: &str, lit: bool, age_nonzero: bool) -> u32 {
+        match name {
+            "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air" => AIR,
+            "minecraft:fire" => FIRE,
+            "minecraft:soul_fire" => SOUL_FIRE,
+            "minecraft:lava_cauldron" => LAVA_CAULDRON,
+            "minecraft:bubble_column" => BUBBLE_COLUMN,
+            "minecraft:powder_snow" => POWDER_SNOW,
+            "minecraft:cactus" => CACTUS,
+            "minecraft:campfire" if lit => LIT_CAMPFIRE,
+            "minecraft:soul_campfire" if lit => LIT_SOUL_CAMPFIRE,
+            "minecraft:cobweb" => COBWEB,
+            "minecraft:sweet_berry_bush" => {
+                if age_nonzero {
+                    SWEET_BERRY_BUSH | SWEET_BERRY_BUSH_PRICKLY
+                } else {
+                    SWEET_BERRY_BUSH
+                }
+            }
+            "minecraft:honey_block" => HONEY_BLOCK,
+            "minecraft:wither_rose" => WITHER_ROSE,
+            "minecraft:open_eyeblossom" => OPEN_EYEBLOSSOM,
+            "minecraft:lava" => LAVA,
+            _ => 0,
+        }
+    }
+}
+
+fn next_hazard_tag() -> u32 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    loop {
+        let tag = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if tag != 0 {
+            return tag;
+        }
+    }
+}
+
 pub struct BlockFacts {
     pub states: Vec<StateFacts>,
+    /// Dense per-state hazard bitmask (`hazard::*`), indexed by `BlockStateId.0`.
+    pub hazards: Vec<u32>,
+    /// Non-zero tag identifying this `hazards` table for per-section palette mask caching
+    /// (`0` disables caching on synthetic test fixtures).
+    pub hazard_tag: u32,
     pub air: BlockStateId,
     /// Each sign block's `SignBlock.getWoodType` name.
     pub woods: HashMap<Arc<str>, Arc<str>>,
@@ -465,6 +553,7 @@ impl BlockFacts {
         };
         let mut shapes = decode::Shapes::default();
         let mut states = Vec::with_capacity(entries.len());
+        let mut hazards = Vec::with_capacity(entries.len());
         for (index, entry) in entries.iter().enumerate() {
             let id = BlockStateId(index as u32);
             if entry.id != Some(index as u64) {
@@ -527,6 +616,19 @@ impl BlockFacts {
             } else {
                 MAP_COLORS.iter().position(|c| *c == col).unwrap_or(0) as u8
             };
+            let fluid_hazard = match fluid {
+                Fluid::None => 0,
+                Fluid::Water => hazard::WATER,
+                Fluid::Lava => hazard::LAVA,
+                Fluid::Modded => hazard::MODDED_FLUID,
+            };
+            hazards.push(
+                hazard::for_state(
+                    state.name.as_str(),
+                    prop("lit") == Some("true"),
+                    prop("age").is_some_and(|a| a != "0"),
+                ) | fluid_hazard,
+            );
             states.push(StateFacts {
                 map_color,
                 outline,
@@ -588,6 +690,8 @@ impl BlockFacts {
         Ok((
             Self {
                 states,
+                hazards,
+                hazard_tag: next_hazard_tag(),
                 air: registry
                     .default_state("minecraft:air")
                     .ok_or("missing air")?,
@@ -605,6 +709,36 @@ impl BlockFacts {
             .get(id.0 as usize)
             .unwrap_or_else(|| &self.states[self.air.0 as usize])
     }
+    /// Precomputed hazard bitmask (`hazard::*`) for `id`; unknown states fall back to air.
+    #[inline]
+    pub fn hazards(&self, id: BlockStateId) -> u32 {
+        self.hazards
+            .get(id.0 as usize)
+            .copied()
+            .unwrap_or_else(|| self.hazards_fallback(id))
+    }
+    #[cold]
+    #[inline(never)]
+    fn hazards_fallback(&self, id: BlockStateId) -> u32 {
+        if let Some(state) = self.states.get(id.0 as usize) {
+            let fluid_hazard = match state.fluid {
+                Fluid::None => 0,
+                Fluid::Water => hazard::WATER,
+                Fluid::Lava => hazard::LAVA,
+                Fluid::Modded => hazard::MODDED_FLUID,
+            };
+            return hazard::for_state(&state.name, false, false) | fluid_hazard;
+        }
+        self.hazards
+            .get(self.air.0 as usize)
+            .copied()
+            .unwrap_or(hazard::AIR)
+    }
+    /// Whether `id` carries any bit in `mask` (`hazard::*`).
+    #[inline]
+    pub fn has_hazard(&self, id: BlockStateId, mask: u32) -> bool {
+        self.hazards(id) & mask != 0
+    }
     /// `SignBlock.getWoodType`'s name for a sign block.
     pub fn wood_type(&self, block: &str) -> Option<&str> {
         self.woods.get(block).map(|wood| &**wood)
@@ -613,11 +747,9 @@ impl BlockFacts {
     pub fn sign_text(&self, block: &str) -> Option<SignTextDefaults> {
         self.sign_texts.get(block).copied()
     }
+    #[inline]
     pub fn is_air(&self, id: BlockStateId) -> bool {
-        matches!(
-            &*self.get(id).name,
-            "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
-        )
+        self.has_hazard(id, hazard::AIR)
     }
 }
 

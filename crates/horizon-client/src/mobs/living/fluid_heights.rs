@@ -31,34 +31,43 @@ impl MobWorld<'_> {
         let b = bounds.deflate(Vec3::new(0.001, 0.001, 0.001));
         let (lo, hi) = (b.min_position(), b.max_position());
         let mut out = Fluids::default();
+        if !lo.is_finite() || !hi.is_finite() {
+            return out;
+        }
+        let (Some(hi_x), Some(hi_y), Some(hi_z)) = (
+            (hi.x.ceil() as i32).checked_sub(1),
+            (hi.y.ceil() as i32).checked_sub(1),
+            (hi.z.ceil() as i32).checked_sub(1),
+        ) else {
+            return out;
+        };
+        let (lo_x, lo_y, lo_z) = (
+            lo.x.floor() as i32,
+            lo.y.floor() as i32,
+            lo.z.floor() as i32,
+        );
         // The eye column below, in the box but for a box thinner than the
         // deflation.
         let (ex, ez) = (
             ((lo.x + hi.x) / 2.0).floor() as i32,
             ((lo.z + hi.z) / 2.0).floor() as i32,
         );
-        // Most boxes are in sections without a fluid: no cell to read.
+        // Most boxes are in sections without water or lava: no cell to read.
         let cells = (
-            [
-                (lo.x.floor() as i32).min(ex),
-                lo.y.floor() as i32,
-                (lo.z.floor() as i32).min(ez),
-            ],
-            [
-                (hi.x.ceil() as i32 - 1).max(ex),
-                hi.y.ceil() as i32 - 1,
-                (hi.z.ceil() as i32 - 1).max(ez),
-            ],
+            [lo_x.min(ex), lo_y, lo_z.min(ez)],
+            [hi_x.max(ex), hi_y, hi_z.max(ez)],
         );
-        if !self
-            .world
-            .may_hold(cells.0, cells.1, |s| self.facts.get(s).fluid != Fluid::None)
-        {
+        if !self.world.may_hold_hazard(
+            cells.0,
+            cells.1,
+            self.facts,
+            crate::blocks::hazard::WATER_OR_LAVA,
+        ) {
             return out;
         }
-        for x in lo.x.floor() as i32..=(hi.x.ceil() as i32 - 1) {
-            for y in lo.y.floor() as i32..=(hi.y.ceil() as i32 - 1) {
-                for z in lo.z.floor() as i32..=(hi.z.ceil() as i32 - 1) {
+        for x in lo_x..=hi_x {
+            for y in lo_y..=hi_y {
+                for z in lo_z..=hi_z {
                     let (fluid, h) = self.fluid_height(x, y, z);
                     if fluid == Fluid::None {
                         continue;
@@ -85,7 +94,7 @@ impl MobWorld<'_> {
         // EntityFluidInteraction.update: the eyes are in a fluid block of
         // the box in the entity's column, between its bottom and its height
         // for the camera, for water and for lava.
-        for y in lo.y.floor() as i32..=(hi.y.ceil() as i32 - 1) {
+        for y in lo_y..=hi_y {
             let (fluid, h) = self.fluid_height(ex, y, ez);
             // `updateFluidOnEyes` tracks every fluid tag: water and lava.
             let eyes = match fluid {

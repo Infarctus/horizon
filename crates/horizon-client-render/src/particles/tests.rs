@@ -29,6 +29,8 @@ fn with_empty_particle_level(test: impl FnOnce(&ParticleLevel<'_>)) {
     let collision = BlockCollisionRegistry::new(std::sync::Arc::new(cached)).unwrap();
     let facts = BlockFacts {
         states: vec![],
+        hazards: vec![],
+        hazard_tag: 0,
         air: BlockStateId(0),
         woods: HashMap::new(),
         sign_texts: HashMap::new(),
@@ -873,6 +875,8 @@ fn mod_animation_advances_in_the_tick_with_and_without_curves() {
     let collision = BlockCollisionRegistry::new(std::sync::Arc::new(cached)).unwrap();
     let facts = BlockFacts {
         states: vec![],
+        hazards: vec![],
+        hazard_tag: 0,
         air: BlockStateId(0),
         woods: HashMap::new(),
         sign_texts: HashMap::new(),
@@ -972,6 +976,8 @@ fn mod_particle_ticks_motion_curves_and_removal() {
     let collision = BlockCollisionRegistry::new(std::sync::Arc::new(cached)).unwrap();
     let facts = BlockFacts {
         states: vec![],
+        hazards: vec![],
+        hazard_tag: 0,
         air: BlockStateId(0),
         woods: HashMap::new(),
         sign_texts: HashMap::new(),

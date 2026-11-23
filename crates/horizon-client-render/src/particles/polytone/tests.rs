@@ -70,6 +70,8 @@ fn scene(blocks: &'static BlockRegistry) -> Scene {
         world,
         facts: crate::blocks::BlockFacts {
             states: vec![],
+            hazards: vec![],
+            hazard_tag: 0,
             air: BlockStateId(0),
             woods: HashMap::new(),
             sign_texts: HashMap::new(),

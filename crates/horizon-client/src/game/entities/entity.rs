@@ -839,7 +839,7 @@ impl Game<'_> {
             to: inside.item.position,
             original: None,
         };
-        let mut visited = crate::fast_hash::FxHashSet::default();
+        let mut visited = horizon_client::block_contact::VisitedCells::new();
         let _ = horizon_client::block_contact::sweep_movements(
             &mut inside,
             &[movement],
@@ -903,7 +903,7 @@ impl Game<'_> {
             to: inside.shot.position,
             original: None,
         };
-        let mut visited = crate::fast_hash::FxHashSet::default();
+        let mut visited = horizon_client::block_contact::VisitedCells::new();
         let _ = horizon_client::block_contact::sweep_movements(
             &mut inside,
             &[movement],

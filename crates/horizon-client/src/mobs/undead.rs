@@ -561,29 +561,13 @@ fn zombified_piglin_step(m: &mut Mob, cx: &mut Cx) {
         }
     }
 }
-/// `Entity.isInPowderSnow`: the mob's box, shrunk by `1.0E-5` as in
-/// `checkInsideBlocks`, touches powder snow.
-fn in_powder_snow(m: &Mob, w: &super::MobWorld) -> bool {
-    let b = m.bounds().deflate(Vec3::new(1e-5, 1e-5, 1e-5));
-    let (min, max) = (b.min_position(), b.max_position());
-    for x in min.x.floor() as i32..=max.x.floor() as i32 {
-        for y in min.y.floor() as i32..=max.y.floor() as i32 {
-            for z in min.z.floor() as i32..=max.z.floor() as i32 {
-                if &*w.facts.get(w.world.block(x, y, z)).name == "minecraft:powder_snow" {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
 /// `Skeleton.freezingTracker` (`ConversionTracker.tick`): 140 ticks in
 /// powder snow start a conversion into a stray that takes 300 more; leaving
 /// the snow stops it. `counter` is the affliction time (-1 outside the snow)
 /// and `counter2` the conversion time plus one while converting, so that
 /// reaching 0 is vanilla's `conversionTime < 0`.
 fn skeleton_freezing(m: &mut Mob, cx: &mut Cx) {
-    if !in_powder_snow(m, cx.w) {
+    if !super::ai::in_powder_snow(m, cx.w) {
         m.extra.counter = -1;
         m.extra.counter2 = 0;
     } else if m.extra.counter2 > 0 {

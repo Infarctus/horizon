@@ -911,7 +911,14 @@ impl Mob {
         // Entity.applyEffectsFromBlocks walks the recorded move, so a mob
         // leaving a column sideways this tick still gets its last lift. The
         // final box alone misses columns the start of the move touched.
-        let swept = self.bounds_at(self.previous).union_bounds(self.bounds());
+        let bounds = self.bounds();
+        let swept = if self.previous == self.position {
+            bounds
+        } else {
+            bounds
+                .move_by(self.previous.subtract(self.position))
+                .union_bounds(bounds)
+        };
         if crate::motion::bubble_column_push_over(
             w.world,
             w.registry,

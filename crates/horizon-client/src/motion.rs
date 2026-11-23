@@ -1959,11 +1959,11 @@ impl MotionWorld<'_, '_, '_> {
         thread_local! {
             static SCRATCH: std::cell::RefCell<(
                 Vec<MovementRecord>,
-                crate::fast_hash::FxHashSet<i64>,
+                crate::block_contact::VisitedCells,
                 mod_api::InsideEffects,
             )> = std::cell::RefCell::new((
                 Vec::new(),
-                crate::fast_hash::FxHashSet::default(),
+                crate::block_contact::VisitedCells::new(),
                 mod_api::InsideEffects::default(),
             ));
         }
@@ -1978,7 +1978,7 @@ impl MotionWorld<'_, '_, '_> {
         });
         struct Restore(
             Vec<MovementRecord>,
-            crate::fast_hash::FxHashSet<i64>,
+            crate::block_contact::VisitedCells,
             mod_api::InsideEffects,
         );
         impl Drop for Restore {

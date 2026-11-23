@@ -607,6 +607,8 @@ mod adjacent_flags_tests {
                 make_fact("minecraft:water", false, 0, Fluid::Water),
                 make_fact("mod:custom_fluid", false, 0, Fluid::Modded),
             ],
+            hazards: Vec::new(),
+            hazard_tag: 0,
             air: BlockStateId(0),
             woods: Default::default(),
             sign_texts: Default::default(),

@@ -12,7 +12,7 @@ use crate::nbt::Tag;
 use crate::storage::{locate, mask};
 use std::sync::{
     Arc, OnceLock,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -348,6 +348,27 @@ impl Drop for SavedNbt {
     }
 }
 
+/// Lazily cached bitmask over a list palette, keyed by a non-zero caller tag in
+/// the upper 32 bits (`0` means empty/invalidated). The lower 32 bits hold the
+/// bitwise OR of `mask_of(entry)` across the palette's entries.
+#[derive(Default)]
+struct PaletteMaskCache(AtomicU64);
+
+impl Clone for PaletteMaskCache {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self(AtomicU64::new(self.0.load(Ordering::Relaxed)))
+    }
+}
+
+impl std::fmt::Debug for PaletteMaskCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("PaletteMaskCache")
+            .field(&self.0.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PalettedContainer {
     strategy: Strategy,
@@ -357,6 +378,7 @@ pub struct PalettedContainer {
     /// Which container this is, and how many writes it has had (see [`Identity`]).
     identity: Identity,
     saved_nbt: OnceLock<Arc<SavedNbt>>,
+    mask_cache: PaletteMaskCache,
 }
 impl PalettedContainer {
     /// `(uid, edits)`: equal to an earlier answer only if this is the same container and none of
@@ -375,6 +397,7 @@ impl PalettedContainer {
             words: Vec::new(),
             identity: Identity::default(),
             saved_nbt: OnceLock::new(),
+            mask_cache: PaletteMaskCache::default(),
         }
     }
     pub fn strategy(&self) -> Strategy {
@@ -558,6 +581,7 @@ impl PalettedContainer {
                     id
                 } else if list.len() < 1 << self.bits {
                     list.push(value);
+                    *self.mask_cache.0.get_mut() = 0;
                     list.len() - 1
                 } else {
                     self.resize(self.bits + 1, value)
@@ -620,6 +644,7 @@ impl PalettedContainer {
         self.palette = palette;
         self.bits = storage_bits;
         self.words = words;
+        *self.mask_cache.0.get_mut() = 0;
         id as usize
     }
     #[inline(always)]
@@ -804,6 +829,7 @@ impl PalettedContainer {
                 identity: Identity::default(),
                 palette: Palette::List(palette),
                 saved_nbt: OnceLock::new(),
+                mask_cache: PaletteMaskCache::default(),
             },
             Config::Global => {
                 let bits = strategy.global_bits;
@@ -814,6 +840,7 @@ impl PalettedContainer {
                     identity: Identity::default(),
                     palette: Palette::Global,
                     saved_nbt: OnceLock::new(),
+                    mask_cache: PaletteMaskCache::default(),
                 }
             }
         }
@@ -854,6 +881,7 @@ impl PalettedContainer {
                     words,
                     identity: Identity::default(),
                     saved_nbt: OnceLock::new(),
+                    mask_cache: PaletteMaskCache::default(),
                 };
                 container.check_indices()?;
                 Ok(container)
@@ -865,6 +893,7 @@ impl PalettedContainer {
                 words,
                 identity: Identity::default(),
                 saved_nbt: OnceLock::new(),
+                mask_cache: PaletteMaskCache::default(),
             }),
         }
     }
@@ -1056,6 +1085,7 @@ impl PalettedContainer {
                 identity: Identity::default(),
                 palette: Palette::List(palette),
                 saved_nbt: OnceLock::new(),
+                mask_cache: PaletteMaskCache::default(),
             };
             container.check_indices()?;
             return Ok(container);
@@ -1075,11 +1105,51 @@ impl PalettedContainer {
     }
     /// Whether any palette entry satisfies `predicate` (`maybeHas`): entries
     /// no longer used by any position still count.
+    #[inline]
     pub fn maybe_has(&self, mut predicate: impl FnMut(u32) -> bool) -> bool {
         match &self.palette {
             Palette::Single(value) => predicate(*value),
             Palette::List(list) => list.iter().any(|&v| predicate(v)),
             Palette::Global => (0..1u32 << self.bits.min(31)).any(predicate),
+        }
+    }
+    /// Whether any palette entry satisfies `predicate`, returning `true`
+    /// immediately for a global palette without scanning the whole registry.
+    #[inline]
+    pub fn maybe_has_or_global(&self, mut predicate: impl FnMut(u32) -> bool) -> bool {
+        match &self.palette {
+            Palette::Single(value) => predicate(*value),
+            Palette::List(list) => list.iter().any(|&v| predicate(v)),
+            Palette::Global => true,
+        }
+    }
+    /// Bitwise OR of `mask_of(entry)` across every entry in the palette
+    /// (`u32::MAX` for a global palette). When `tag != 0`, a list palette's
+    /// mask is lazily cached in place keyed by `tag` and invalidated whenever
+    /// the palette grows or resizes.
+    #[inline]
+    pub fn palette_mask(&self, tag: u32, mut mask_of: impl FnMut(u32) -> u32) -> u32 {
+        match &self.palette {
+            Palette::Single(value) => mask_of(*value),
+            Palette::Global => u32::MAX,
+            Palette::List(list) => {
+                if tag != 0 {
+                    let cached = self.mask_cache.0.load(Ordering::Relaxed);
+                    if (cached >> 32) as u32 == tag {
+                        return cached as u32;
+                    }
+                }
+                let mut acc = 0u32;
+                for &v in list {
+                    acc |= mask_of(v);
+                }
+                if tag != 0 {
+                    self.mask_cache
+                        .0
+                        .store((u64::from(tag) << 32) | u64::from(acc), Ordering::Relaxed);
+                }
+                acc
+            }
         }
     }
     /// Whether any entry satisfies `predicate`. Unlike [`Self::maybe_has`],

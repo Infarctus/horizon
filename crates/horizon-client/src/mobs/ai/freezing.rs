@@ -3,12 +3,24 @@ use super::{Mob, MobWorld};
 use horizon_core::geometry::Vec3;
 
 pub(crate) fn in_powder_snow(m: &Mob, w: &MobWorld) -> bool {
-    let b = m.bounds().deflate(Vec3::new(1e-5, 1e-5, 1e-5));
-    let (min, max) = (b.min_position(), b.max_position());
-    for x in min.x.floor() as i32..=max.x.floor() as i32 {
-        for y in min.y.floor() as i32..=max.y.floor() as i32 {
-            for z in min.z.floor() as i32..=max.z.floor() as i32 {
-                if &*w.facts.get(w.world.block(x, y, z)).name == "minecraft:powder_snow" {
+    use crate::blocks::hazard;
+    let Some((lo, hi)) = crate::motion::environment::closed_cell_bounds(
+        m.bounds().deflate(Vec3::new(1e-5, 1e-5, 1e-5)),
+    ) else {
+        return false;
+    };
+    if !w
+        .world
+        .may_hold_hazard(lo, hi, w.facts, hazard::POWDER_SNOW)
+    {
+        return false;
+    }
+    for x in lo[0]..=hi[0] {
+        for y in lo[1]..=hi[1] {
+            for z in lo[2]..=hi[2] {
+                if w.facts
+                    .has_hazard(w.world.block(x, y, z), hazard::POWDER_SNOW)
+                {
                     return true;
                 }
             }

@@ -687,20 +687,22 @@ impl ItemEntity {
     /// factor of the last such block the item's box (deflated by `1.0E-5`) is
     /// in.
     fn stuck_multiplier(&self, world: &World, facts: &BlockFacts) -> Option<Vec3> {
-        let b = self.bounds().deflate(Vec3::new(1e-5, 1e-5, 1e-5));
-        let (lo, hi) = (b.min_position(), b.max_position());
+        use crate::blocks::hazard;
+        let (lo, hi) = crate::motion::environment::closed_cell_bounds(
+            self.bounds().deflate(Vec3::new(1e-5, 1e-5, 1e-5)),
+        )?;
+        if !world.may_hold_hazard(lo, hi, facts, hazard::ITEM_STUCK) {
+            return None;
+        }
         let mut stuck = None;
-        for x in lo.x.floor() as i32..=hi.x.floor() as i32 {
-            for y in lo.y.floor() as i32..=hi.y.floor() as i32 {
-                for z in lo.z.floor() as i32..=hi.z.floor() as i32 {
-                    match &*facts.get(world.block(x, y, z)).name {
-                        "minecraft:cobweb" => {
-                            stuck = Some(Vec3::new(0.25, f64::from(0.05_f32), 0.25));
-                        }
-                        "minecraft:powder_snow" => {
-                            stuck = Some(Vec3::new(f64::from(0.9_f32), 1.5, f64::from(0.9_f32)));
-                        }
-                        _ => {}
+        for x in lo[0]..=hi[0] {
+            for y in lo[1]..=hi[1] {
+                for z in lo[2]..=hi[2] {
+                    let h = facts.hazards(world.block(x, y, z));
+                    if h & hazard::COBWEB != 0 {
+                        stuck = Some(Vec3::new(0.25, f64::from(0.05_f32), 0.25));
+                    } else if h & hazard::POWDER_SNOW != 0 {
+                        stuck = Some(Vec3::new(f64::from(0.9_f32), 1.5, f64::from(0.9_f32)));
                     }
                 }
             }
@@ -741,12 +743,22 @@ impl ItemEntity {
     /// entity event 53 are skipped (`doesEntityDoHoneyBlockSlideEffects` is
     /// false for an item).
     fn apply_honey_slide(&mut self, world: &World, facts: &BlockFacts) {
-        let b = self.bounds().deflate(Vec3::new(1e-5, 1e-5, 1e-5));
-        let (lo, hi) = (b.min_position(), b.max_position());
-        for x in lo.x.floor() as i32..=hi.x.floor() as i32 {
-            for y in lo.y.floor() as i32..=hi.y.floor() as i32 {
-                for z in lo.z.floor() as i32..=hi.z.floor() as i32 {
-                    if &*facts.get(world.block(x, y, z)).name == "minecraft:honey_block" {
+        use crate::blocks::hazard;
+        if self.on_ground || self.velocity.y / f64::from(0.98_f32) + 0.08 >= -0.08 {
+            return;
+        }
+        let Some((lo, hi)) = crate::motion::environment::closed_cell_bounds(
+            self.bounds().deflate(Vec3::new(1e-5, 1e-5, 1e-5)),
+        ) else {
+            return;
+        };
+        if !world.may_hold_hazard(lo, hi, facts, hazard::HONEY_BLOCK) {
+            return;
+        }
+        for x in lo[0]..=hi[0] {
+            for y in lo[1]..=hi[1] {
+                for z in lo[2]..=hi[2] {
+                    if facts.has_hazard(world.block(x, y, z), hazard::HONEY_BLOCK) {
                         self.honey_block_inside([x, y, z]);
                     }
                 }
@@ -797,28 +809,24 @@ impl ItemEntity {
 /// `LavaCauldronBlock.getEntityInsideCollisionShape`: the cauldron's solid
 /// shape plus its contents (12 pixels wide, from 4 through 15 pixels high).
 /// In particular, the rim and feet count too, but air above the contents does not.
-pub(crate) fn lava_cauldron_contacts(
-    world: &World,
-    registry: &horizon_world::registry::BlockRegistry,
-    bounds: Aabb,
-) -> usize {
+pub(crate) fn lava_cauldron_contacts(world: &World, facts: &BlockFacts, bounds: Aabb) -> usize {
+    use crate::blocks::hazard;
     use horizon_core::geometry::ShapeOp;
     static SHAPE: std::sync::OnceLock<VoxelShape> = std::sync::OnceLock::new();
     let epsilon = f64::from(1e-5_f32);
+    let Some((lo, hi)) = crate::motion::environment::closed_cell_bounds(
+        bounds.deflate(Vec3::new(epsilon, epsilon, epsilon)),
+    ) else {
+        return 0;
+    };
+    if !world.may_hold_hazard(lo, hi, facts, hazard::LAVA_CAULDRON) {
+        return 0;
+    }
     let mut contacts = 0;
-    let candidates = bounds.deflate(Vec3::new(epsilon, epsilon, epsilon));
-    for x in candidates.min_position().x.floor() as i32..=candidates.max_position().x.floor() as i32
-    {
-        for y in
-            candidates.min_position().y.floor() as i32..=candidates.max_position().y.floor() as i32
-        {
-            for z in candidates.min_position().z.floor() as i32
-                ..=candidates.max_position().z.floor() as i32
-            {
-                if !registry
-                    .state(world.block(x, y, z))
-                    .is_some_and(|s| s.name == "minecraft:lava_cauldron")
-                {
+    for x in lo[0]..=hi[0] {
+        for y in lo[1]..=hi[1] {
+            for z in lo[2]..=hi[2] {
+                if !facts.has_hazard(world.block(x, y, z), hazard::LAVA_CAULDRON) {
                     continue;
                 }
                 let shape = SHAPE.get_or_init(|| {
@@ -2208,19 +2216,38 @@ impl ArmorStand {
         &self,
         world: &World,
         facts: &BlockFacts,
-        registry: &horizon_world::registry::BlockRegistry,
+        _registry: &horizon_world::registry::BlockRegistry,
     ) -> bool {
+        use crate::blocks::hazard;
         if self.no_physics.unwrap_or(self.marker || self.no_gravity) {
             return false;
         }
-        let (lo, hi) = (self.bounds().min_position(), self.bounds().max_position());
-        let lava = (lo.x.floor() as i32..=hi.x.floor() as i32).any(|x| {
-            (lo.y.floor() as i32..hi.y.ceil() as i32).any(|y| {
-                (lo.z.floor() as i32..=hi.z.floor() as i32)
-                    .any(|z| facts.get(world.block(x, y, z)).fluid == Fluid::Lava)
-            })
-        });
-        lava || crate::motion::environment::fire_contact(world, registry, self.bounds()) > 0.0
+        let bounds = self.bounds();
+        let (min, max) = (bounds.min_position(), bounds.max_position());
+        let lava = if min.is_finite()
+            && max.is_finite()
+            && let Some(hi_y) = (max.y.ceil() as i32).checked_sub(1)
+        {
+            let lo = [
+                min.x.floor() as i32,
+                min.y.floor() as i32,
+                min.z.floor() as i32,
+            ];
+            let hi = [max.x.floor() as i32, hi_y, max.z.floor() as i32];
+            lo[0] <= hi[0]
+                && lo[1] <= hi[1]
+                && lo[2] <= hi[2]
+                && world.may_hold_hazard(lo, hi, facts, hazard::LAVA)
+                && (lo[0]..=hi[0]).any(|x| {
+                    (lo[1]..=hi[1]).any(|y| {
+                        (lo[2]..=hi[2])
+                            .any(|z| facts.has_hazard(world.block(x, y, z), hazard::LAVA))
+                    })
+                })
+        } else {
+            false
+        };
+        lava || crate::motion::environment::fire_contact(world, facts, bounds) > 0.0
     }
     pub fn environment_tick_with_hook(
         &mut self,
@@ -2237,21 +2264,39 @@ impl ArmorStand {
         &mut self,
         world: &mut W,
         facts: &BlockFacts,
-        registry: &horizon_world::registry::BlockRegistry,
+        _registry: &horizon_world::registry::BlockRegistry,
         mut invulnerable: impl FnMut(&mut W, &str) -> bool,
     ) -> Option<&'static str> {
-        let (lo, hi) = (self.bounds().min_position(), self.bounds().max_position());
+        let bounds = self.bounds();
+        let (min, max) = (bounds.min_position(), bounds.max_position());
         // The damage type of the last hit that lowered its health.
         let mut hit_by = None;
         let mut water = false;
         let mut lava = false;
-        for x in lo.x.floor() as i32..=hi.x.floor() as i32 {
-            for y in lo.y.floor() as i32..hi.y.ceil() as i32 {
-                for z in lo.z.floor() as i32..=hi.z.floor() as i32 {
-                    match facts.get(world.block(x, y, z)).fluid {
-                        Fluid::Water => water = true,
-                        Fluid::Lava => lava = true,
-                        _ => {}
+        if min.is_finite()
+            && max.is_finite()
+            && let Some(hi_y) = (max.y.ceil() as i32).checked_sub(1)
+        {
+            let lo = [
+                min.x.floor() as i32,
+                min.y.floor() as i32,
+                min.z.floor() as i32,
+            ];
+            let hi = [max.x.floor() as i32, hi_y, max.z.floor() as i32];
+            if lo[0] <= hi[0]
+                && lo[1] <= hi[1]
+                && lo[2] <= hi[2]
+                && world.may_hold_hazard(lo, hi, facts, crate::blocks::hazard::WATER_OR_LAVA)
+            {
+                for x in lo[0]..=hi[0] {
+                    for y in lo[1]..=hi[1] {
+                        for z in lo[2]..=hi[2] {
+                            match facts.get(world.block(x, y, z)).fluid {
+                                Fluid::Water => water = true,
+                                Fluid::Lava => lava = true,
+                                _ => {}
+                            }
+                        }
                     }
                 }
             }
@@ -2280,22 +2325,25 @@ impl ArmorStand {
         // The fire blocks the box (less 1e-5) is in, each visited once by
         // `Entity.checkInsideBlocks`.
         let fires = if affected {
-            let b = self.bounds().deflate(Vec3::new(1e-5, 1e-5, 1e-5));
-            let (lo, hi) = (b.min_position(), b.max_position());
-            let mut n = 0;
-            for x in lo.x.floor() as i32..=hi.x.floor() as i32 {
-                for y in lo.y.floor() as i32..=hi.y.floor() as i32 {
-                    for z in lo.z.floor() as i32..=hi.z.floor() as i32 {
-                        let name = registry
-                            .state(world.block(x, y, z))
-                            .map(|s| s.name.as_str());
-                        if matches!(name, Some("minecraft:fire" | "minecraft:soul_fire")) {
-                            n += 1;
+            use crate::blocks::hazard;
+            if let Some((lo, hi)) = crate::motion::environment::closed_cell_bounds(
+                bounds.deflate(Vec3::new(1e-5, 1e-5, 1e-5)),
+            ) && world.may_hold_hazard(lo, hi, facts, hazard::ANY_FIRE)
+            {
+                let mut n = 0;
+                for x in lo[0]..=hi[0] {
+                    for y in lo[1]..=hi[1] {
+                        for z in lo[2]..=hi[2] {
+                            if facts.has_hazard(world.block(x, y, z), hazard::ANY_FIRE) {
+                                n += 1;
+                            }
                         }
                     }
                 }
+                n
+            } else {
+                0
             }
-            n
         } else {
             0
         };
@@ -2632,13 +2680,20 @@ impl ArmorStand {
         }
         // Entity.checkInsideBlocks: test the deflated body against block cells,
         // not their inset collision shape (the stand slides beside that shape).
-        let bounds = self.bounds().deflate(Vec3::new(1e-5, 1e-5, 1e-5));
-        let (lo, hi) = (bounds.min_position(), bounds.max_position());
+        use crate::blocks::hazard;
+        let Some((lo, hi)) = crate::motion::environment::closed_cell_bounds(
+            self.bounds().deflate(Vec3::new(1e-5, 1e-5, 1e-5)),
+        ) else {
+            return;
+        };
+        if !world.may_hold_hazard(lo, hi, facts, hazard::HONEY_BLOCK) {
+            return;
+        }
         let overlap = 0.4375 + if self.small { 0.125 } else { 0.25 };
-        for x in lo.x.floor() as i32..=hi.x.floor() as i32 {
-            for y in lo.y.floor() as i32..=hi.y.floor() as i32 {
-                for z in lo.z.floor() as i32..=hi.z.floor() as i32 {
-                    if &*facts.get(world.block(x, y, z)).name != "minecraft:honey_block"
+        for x in lo[0]..=hi[0] {
+            for y in lo[1]..=hi[1] {
+                for z in lo[2]..=hi[2] {
+                    if !facts.has_hazard(world.block(x, y, z), hazard::HONEY_BLOCK)
                         || self.position.y > f64::from(y) + 0.9375 - 1.0e-7
                     {
                         continue;
@@ -3804,6 +3859,8 @@ mod slime_bounce_tests {
         let world = World::new(horizon_world::registry::BlockStateId(0), 0);
         let facts = BlockFacts {
             states: Vec::new(),
+            hazards: Vec::new(),
+            hazard_tag: 0,
             air: horizon_world::registry::BlockStateId(0),
             woods: Default::default(),
             sign_texts: Default::default(),

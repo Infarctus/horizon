@@ -99,6 +99,33 @@ pub fn update_entity_fluids(
     fluids: &FluidResources,
     context: &LoopContext,
 ) -> (f64, f64, bool) {
+    // Most entities are in sections without any fluid: skip allocating
+    // `EntityFluidInteraction` and scanning cells when the palette holds none.
+    let deflated = bounds.deflate(Vec3::new(0.001, 0.001, 0.001));
+    let (min, max) = (deflated.min_position(), deflated.max_position());
+    if !min.is_finite() || !max.is_finite() {
+        return (0.0, 0.0, false);
+    }
+    let lo = [
+        min.x.floor() as i32,
+        min.y.floor() as i32,
+        min.z.floor() as i32,
+    ];
+    let (Some(hi_x), Some(hi_y), Some(hi_z)) = (
+        (max.x.ceil() as i32).checked_sub(1),
+        (max.y.ceil() as i32).checked_sub(1),
+        (max.z.ceil() as i32).checked_sub(1),
+    ) else {
+        return (0.0, 0.0, false);
+    };
+    let hi = [hi_x, hi_y, hi_z];
+    if lo[0] > hi[0]
+        || lo[1] > hi[1]
+        || lo[2] > hi[2]
+        || !world.may_hold(lo, hi, |s| fluids.fluid(s).kind() != FluidKind::Empty)
+    {
+        return (0.0, 0.0, false);
+    }
     let mut interaction = EntityFluidInteraction::new([WATER, LAVA]);
     let mut scene = EntityFluidWorld {
         bounds,

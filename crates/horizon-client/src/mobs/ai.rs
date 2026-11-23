@@ -1529,59 +1529,151 @@ pub(crate) fn effects_from_blocks(
     // runs them, and the part's contact fires there too, staged. (This is the
     // parity change: the 0.2-block sampling over every box cell this replaced
     // visited blocks in another order; the walk's own commit carries it.)
-    let mut visited = crate::fast_hash::FxHashSet::default();
-    let mut effects = mod_api::InsideEffects::default();
+    //
     // `Entity.applyEffectsFromBlocks` walks the tick's own movements; a hurt
     // below that teleports an enderman or a shulker has left the old position
     // as the path's start (#9607), so the walk begins where the tick began:
     // the box's own cells at the start are visited first, as the tick's own
     // first movement would, then the move itself sweeps the path (the shared
     // visited set keeps each block once).
+    use crate::blocks::hazard;
     let start = tick_from;
-    let movements = [horizon_world::entity_move::MovementRecord {
-        from: start,
-        to: tick_to,
-        original: None,
-    }];
+    let stationary = start == tick_to;
     // The box's own cells at the start, as the tick's first movement would
     // visit them (a hurt that teleports leaves the old position as the
     // path's start, #9607).
     let start_box = m.bounds_at(start).deflate(Vec3::new(1e-5, 1e-5, 1e-5));
+    let start_cells = crate::motion::environment::closed_cell_bounds(start_box);
+    let gate_bounds = if stationary {
+        start_cells
+    } else {
+        let end_box = start_box.move_by(tick_to.subtract(start));
+        crate::motion::environment::swept_cell_bounds(start_box, end_box)
+    };
+    let Some((gate_lo, gate_hi)) = gate_bounds else {
+        return;
+    };
+    let active_hooks = crate::block_contact::HOOKS
+        .get()
+        .filter(|h| crate::block_contact::current_level().is_some() && (h.any_inside)());
+    let Some(hooks) = active_hooks else {
+        if !w
+            .world
+            .may_hold_hazard(gate_lo, gate_hi, w.facts, hazard::MOB_INSIDE)
+        {
+            return;
+        }
+        if stationary {
+            if let Some((lo, hi)) = start_cells {
+                for x in lo[0]..=hi[0] {
+                    for y in lo[1]..=hi[1] {
+                        for z in lo[2]..=hi[2] {
+                            let h = w.facts.hazards(w.world.block(x, y, z));
+                            if h & hazard::MOB_INSIDE != 0 {
+                                apply_mob_inside_hazard(m, w, level, events, [x, y, z], h);
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        let mut visited = crate::block_contact::VisitedCells::new();
+        let mut effects = mod_api::InsideEffects::default();
+        let mut inside = MobInside {
+            m,
+            w,
+            level,
+            events: &mut *events,
+            has_hooks: false,
+        };
+        if let Some((lo, hi)) = start_cells {
+            for x in lo[0]..=hi[0] {
+                for y in lo[1]..=hi[1] {
+                    for z in lo[2]..=hi[2] {
+                        let h = w.facts.hazards(w.world.block(x, y, z));
+                        if h & hazard::MOB_INSIDE == 0 {
+                            continue;
+                        }
+                        let at = horizon_core::position::BlockPos::new(x, y, z);
+                        visited.insert(at.pack());
+                        apply_mob_inside_hazard(
+                            inside.m,
+                            inside.w,
+                            inside.level,
+                            inside.events,
+                            [x, y, z],
+                            h,
+                        );
+                    }
+                }
+            }
+        }
+        let movements = [horizon_world::entity_move::MovementRecord {
+            from: start,
+            to: tick_to,
+            original: None,
+        }];
+        let _ = crate::block_contact::sweep_movements(
+            &mut inside,
+            &movements,
+            &mut visited,
+            &mut effects,
+        );
+        return;
+    };
+    if !w.world.may_hold(gate_lo, gate_hi, |s| {
+        w.facts.has_hazard(s, hazard::MOB_INSIDE)
+            || (!w.facts.is_air(s) && (hooks.inside_listens)(s))
+    }) {
+        return;
+    }
+    let mut visited = crate::block_contact::VisitedCells::new();
+    let mut effects = mod_api::InsideEffects::default();
     let mut inside = MobInside {
         m,
         w,
         level,
         events: &mut *events,
+        has_hooks: true,
     };
-    let lo = start_box.min_position();
-    let hi = start_box.max_position();
-    for x in lo.x.floor() as i32..=hi.x.floor() as i32 {
-        for y in lo.y.floor() as i32..=hi.y.floor() as i32 {
-            for z in lo.z.floor() as i32..=hi.z.floor() as i32 {
-                let at = horizon_core::position::BlockPos::new(x, y, z);
-                let state = w.world.block(x, y, z);
-                let solid = w.registry.state(state).is_none_or(|d| {
-                    !matches!(
-                        d.name.as_str(),
-                        "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
-                    )
-                });
-                if solid
-                    && visited.insert(at.pack())
-                    && let Ok(()) = crate::block_contact::InsideWalk::entity_inside(
+    if let Some((lo, hi)) = start_cells {
+        for x in lo[0]..=hi[0] {
+            for y in lo[1]..=hi[1] {
+                for z in lo[2]..=hi[2] {
+                    let state = w.world.block(x, y, z);
+                    if w.facts.is_air(state) {
+                        continue;
+                    }
+                    let at = horizon_core::position::BlockPos::new(x, y, z);
+                    if !stationary {
+                        visited.insert(at.pack());
+                    }
+                    let _ = crate::block_contact::InsideWalk::entity_inside(
                         &mut inside,
                         at,
                         state,
                         0,
                         false,
                         &mut effects,
-                    )
-                {}
+                    );
+                }
             }
         }
     }
-    let _ =
-        crate::block_contact::sweep_movements(&mut inside, &movements, &mut visited, &mut effects);
+    if !stationary {
+        let movements = [horizon_world::entity_move::MovementRecord {
+            from: start,
+            to: tick_to,
+            original: None,
+        }];
+        let _ = crate::block_contact::sweep_movements(
+            &mut inside,
+            &movements,
+            &mut visited,
+            &mut effects,
+        );
+    }
     let MobInside { m, level, .. } = inside;
     // `applyAndClear` for the part's queued writes, in the collector's order,
     // in this mob's tick, until it dies.
@@ -1632,6 +1724,95 @@ fn apply_entity_write(m: &mut Mob, level: &mut DamageLevel<'_>, write: mod_api::
     }
 }
 
+/// Vanilla `entityInside` block hazards for a mob at `p` whose precomputed hazard
+/// bitmask `h` carries at least one `hazard::MOB_INSIDE` bit.
+fn apply_mob_inside_hazard(
+    m: &mut Mob,
+    w: &MobWorld,
+    level: &mut DamageLevel<'_>,
+    events: &mut Vec<MobEvent>,
+    p: [i32; 3],
+    h: u32,
+) {
+    use crate::blocks::hazard;
+    let y = p[1];
+    // PowderSnowBlock.entityInside: a burning mob destroys the
+    // block (`canEntityGrief` for the mob), then EXTINGUISH puts it out.
+    if h & hazard::POWDER_SNOW != 0 {
+        if m.is_on_fire() && w.can_grief(m.id) {
+            events.push(MobEvent::BreakBlock {
+                pos: p,
+                drop: false,
+                by: None,
+                breaker: None,
+            });
+        }
+        m.extinguish_fire();
+        // PowderSnowBlock.entityInside: a living entity is stuck
+        // (and forgets its fall) only while the block at its
+        // own feet is powder snow.
+        let feet = w.world.block(
+            m.position.x.floor() as i32,
+            m.position.y.floor() as i32,
+            m.position.z.floor() as i32,
+        );
+        if w.facts.has_hazard(feet, hazard::POWDER_SNOW) {
+            if m.species() != Species::Wither {
+                m.fall_distance = 0.0;
+                m.stuck_multiplier = Vec3::new(f64::from(0.9_f32), 1.5, f64::from(0.9_f32));
+            }
+            let known_movement = w.controlling_player_movement.unwrap_or(m.velocity);
+            if let Some(velocity) = powder_snow_particle_velocity(known_movement, level.random()) {
+                events.push(MobEvent::PowderSnowParticle {
+                    at: [m.position.x, f64::from(y + 1), m.position.z],
+                    velocity,
+                });
+            }
+        }
+    } else if h & hazard::CACTUS != 0 {
+        m.damage(level, 1.0, Damage::of(DamageKind::Cactus));
+    } else if h & (hazard::LIT_CAMPFIRE | hazard::LIT_SOUL_CAMPFIRE) != 0 {
+        // CampfireBlock.entityInside: a lit campfire hurts a
+        // living entity by its fire damage (1, soul 2).
+        let damage = if h & hazard::LIT_CAMPFIRE != 0 {
+            1.0
+        } else {
+            2.0
+        };
+        m.damage(level, damage, Damage::of(DamageKind::Campfire));
+    } else if h & hazard::COBWEB != 0 {
+        // WebBlock.entityInside -> makeStuckInBlock, which a
+        // spider ignores for cobwebs and a wither always.
+        if !matches!(
+            m.species(),
+            Species::Spider | Species::CaveSpider | Species::Wither
+        ) {
+            m.fall_distance = 0.0;
+            m.stuck_multiplier = if m.has_effect("minecraft:weaving") {
+                Vec3::new(0.5, 0.25, 0.5)
+            } else {
+                Vec3::new(0.25, f64::from(0.05_f32), 0.25)
+            };
+        }
+    } else if h & hazard::SWEET_BERRY_BUSH != 0 {
+        if !matches!(m.species(), Species::Fox | Species::Bee) {
+            if m.species() != Species::Wither {
+                m.fall_distance = 0.0;
+                m.stuck_multiplier = Vec3::new(f64::from(0.8_f32), 0.75, f64::from(0.8_f32));
+            }
+            let moved = m.previous.subtract(m.position);
+            if h & hazard::SWEET_BERRY_BUSH_PRICKLY != 0
+                && moved.horizontal_distance_squared() > 0.0
+                && (moved.x.abs() >= f64::from(0.003_f32) || moved.z.abs() >= f64::from(0.003_f32))
+            {
+                m.damage(level, 1.0, Damage::of(DamageKind::SweetBerryBush));
+            }
+        }
+    } else if h & hazard::HONEY_BLOCK != 0 {
+        honey_slide(m, p, level, events);
+    }
+}
+
 /// The mob's view of the shared inside walk: its box, its life, the level's
 /// blocks, its own `entityInside` moments (kept as their own code, run
 /// mid-walk where vanilla runs them), and the part's contact, fired mid-walk
@@ -1641,6 +1822,7 @@ struct MobInside<'a, 'w, 'l> {
     w: &'a MobWorld<'w>,
     level: &'a mut DamageLevel<'l>,
     events: &'a mut Vec<MobEvent>,
+    has_hooks: bool,
 }
 
 impl crate::block_contact::InsideWalk for MobInside<'_, '_, '_> {
@@ -1655,12 +1837,18 @@ impl crate::block_contact::InsideWalk for MobInside<'_, '_, '_> {
         self.w.world.block(at.x, at.y, at.z)
     }
     fn is_air(&self, state: horizon_world::registry::BlockStateId) -> bool {
-        self.w.registry.state(state).is_none_or(|d| {
-            matches!(
-                d.name.as_str(),
-                "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
-            )
-        })
+        self.w.facts.is_air(state)
+    }
+    #[inline]
+    fn skips_block(&self, state: horizon_world::registry::BlockStateId) -> bool {
+        if self.has_hooks {
+            self.w.facts.is_air(state)
+        } else {
+            !self
+                .w
+                .facts
+                .has_hazard(state, crate::blocks::hazard::MOB_INSIDE)
+        }
     }
     fn inside_shape(
         &mut self,
@@ -1679,11 +1867,11 @@ impl crate::block_contact::InsideWalk for MobInside<'_, '_, '_> {
         precise: bool,
         effects: &mut mod_api::InsideEffects,
     ) -> std::result::Result<(), ()> {
-        let (x, y, z) = (at.x, at.y, at.z);
-        let p = [x, y, z];
+        let p = [at.x, at.y, at.z];
         // The part's contact, mid-walk, staged: its writes join this step only
         // when it answered, and a panic is contained.
-        if let Some(hooks) = crate::block_contact::HOOKS.get()
+        if self.has_hooks
+            && let Some(hooks) = crate::block_contact::HOOKS.get()
             && let Some(dimension) = crate::block_contact::current_level()
             && (hooks.inside_listens)(state)
         {
@@ -1715,100 +1903,9 @@ impl crate::block_contact::InsideWalk for MobInside<'_, '_, '_> {
             effects.absorb_step(staged);
             crate::block_contact::inside_written(state, at, writes);
         }
-        // PowderSnowBlock.entityInside: a burning mob destroys the
-        // block (`canEntityGrief` for the mob), then EXTINGUISH puts it out.
-        if self.w.block_name(x, y, z) == "minecraft:powder_snow" {
-            if self.m.is_on_fire() && self.w.can_grief(self.m.id) {
-                self.events.push(MobEvent::BreakBlock {
-                    pos: p,
-                    drop: false,
-                    by: None,
-                    breaker: None,
-                });
-            }
-            self.m.extinguish_fire();
-        }
-        match self.w.block_name(x, y, z) {
-            "minecraft:cactus" => {
-                self.m
-                    .damage(self.level, 1.0, Damage::of(DamageKind::Cactus));
-            }
-            // CampfireBlock.entityInside: a lit campfire hurts a
-            // living entity by its fire damage (1, soul 2).
-            name @ ("minecraft:campfire" | "minecraft:soul_campfire")
-                if self.w.prop(x, y, z, "lit") == Some("true") =>
-            {
-                let damage = if name == "minecraft:campfire" {
-                    1.0
-                } else {
-                    2.0
-                };
-                self.m
-                    .damage(self.level, damage, Damage::of(DamageKind::Campfire));
-            }
-            // WebBlock.entityInside -> makeStuckInBlock, which a
-            // spider ignores for cobwebs and a wither always.
-            "minecraft:cobweb"
-                if !matches!(
-                    self.m.species(),
-                    Species::Spider | Species::CaveSpider | Species::Wither
-                ) =>
-            {
-                self.m.fall_distance = 0.0;
-                self.m.stuck_multiplier = if self.m.has_effect("minecraft:weaving") {
-                    Vec3::new(0.5, 0.25, 0.5)
-                } else {
-                    Vec3::new(0.25, f64::from(0.05_f32), 0.25)
-                };
-            }
-            "minecraft:sweet_berry_bush"
-                if !matches!(self.m.species(), Species::Fox | Species::Bee) =>
-            {
-                if self.m.species() != Species::Wither {
-                    self.m.fall_distance = 0.0;
-                    self.m.stuck_multiplier =
-                        Vec3::new(f64::from(0.8_f32), 0.75, f64::from(0.8_f32));
-                }
-                let moved = self.m.previous.subtract(self.m.position);
-                if self.w.prop(x, y, z, "age") != Some("0")
-                    && moved.horizontal_distance_squared() > 0.0
-                    && (moved.x.abs() >= f64::from(0.003_f32)
-                        || moved.z.abs() >= f64::from(0.003_f32))
-                {
-                    self.m
-                        .damage(self.level, 1.0, Damage::of(DamageKind::SweetBerryBush));
-                }
-            }
-            // PowderSnowBlock.entityInside: a living entity is stuck
-            // (and forgets its fall) only while the block at its
-            // own feet is powder snow.
-            "minecraft:powder_snow"
-                if self.w.block_name(
-                    self.m.position.x.floor() as i32,
-                    self.m.position.y.floor() as i32,
-                    self.m.position.z.floor() as i32,
-                ) == "minecraft:powder_snow" =>
-            {
-                if self.m.species() != Species::Wither {
-                    self.m.fall_distance = 0.0;
-                    self.m.stuck_multiplier =
-                        Vec3::new(f64::from(0.9_f32), 1.5, f64::from(0.9_f32));
-                }
-                let known_movement = self
-                    .w
-                    .controlling_player_movement
-                    .unwrap_or(self.m.velocity);
-                if let Some(velocity) =
-                    powder_snow_particle_velocity(known_movement, self.level.random())
-                {
-                    self.events.push(MobEvent::PowderSnowParticle {
-                        at: [self.m.position.x, f64::from(y + 1), self.m.position.z],
-                        velocity,
-                    });
-                }
-            }
-            "minecraft:honey_block" => honey_slide(self.m, p, self.level, self.events),
-            _ => {}
+        let h = self.w.facts.hazards(state);
+        if h & crate::blocks::hazard::MOB_INSIDE != 0 {
+            apply_mob_inside_hazard(self.m, self.w, self.level, self.events, p, h);
         }
         Ok(())
     }
@@ -2070,7 +2167,7 @@ fn base_tick(
     if m.species() == Species::Drowned {
         super::undead::drowned_update_swimming(m, w);
     }
-    let fire = crate::motion::environment::fire_contact(w.world, w.registry, m.bounds());
+    let fire = crate::motion::environment::fire_contact(w.world, w.facts, m.bounds());
     let lava = m.fluids.in_lava;
     let contact_at = m.position;
     if fire > 0.0 {
@@ -2185,12 +2282,12 @@ fn base_tick(
         (fire, lava)
     } else {
         (
-            crate::motion::environment::fire_contact(w.world, w.registry, m.bounds()),
+            crate::motion::environment::fire_contact(w.world, w.facts, m.bounds()),
             touches_lava(m, w),
         )
     };
     // LavaCauldronBlock.entityInside: LAVA_IGNITE and lavaHurt, as in lava.
-    let lava = lava || crate::entities::lava_cauldron_contacts(w.world, w.registry, m.bounds()) > 0;
+    let lava = lava || crate::entities::lava_cauldron_contacts(w.world, w.facts, m.bounds()) > 0;
     block_contact_damage(m, w, level, fire, lava);
     // Enderman.hurtServer and Shulker.hurtServer teleport inside the hurt
     // (fire, lava, a block, an effect).
@@ -2237,12 +2334,19 @@ fn freeze_tick(m: &mut Mob, w: &MobWorld, level: &mut DamageLevel<'_>) {
 /// (`Enderman.canRandomlyTeleportTo`, a shulker's empty spot) keeps lava
 /// from the feet.
 fn touches_lava(m: &Mob, w: &MobWorld) -> bool {
-    let b = m.bounds().deflate(Vec3::new(1e-5, 1e-5, 1e-5));
-    let (min, max) = (b.min_position(), b.max_position());
-    for x in min.x.floor() as i32..=max.x.floor() as i32 {
-        for y in min.y.floor() as i32..=max.y.floor() as i32 {
-            for z in min.z.floor() as i32..=max.z.floor() as i32 {
-                if &*w.facts.get(w.world.block(x, y, z)).name == "minecraft:lava" {
+    use crate::blocks::hazard;
+    let Some((lo, hi)) = crate::motion::environment::closed_cell_bounds(
+        m.bounds().deflate(Vec3::new(1e-5, 1e-5, 1e-5)),
+    ) else {
+        return false;
+    };
+    if !w.world.may_hold_hazard(lo, hi, w.facts, hazard::LAVA) {
+        return false;
+    }
+    for x in lo[0]..=hi[0] {
+        for y in lo[1]..=hi[1] {
+            for z in lo[2]..=hi[2] {
+                if w.facts.has_hazard(w.world.block(x, y, z), hazard::LAVA) {
                     return true;
                 }
             }
@@ -3892,45 +3996,72 @@ pub fn custom_travel(
 /// tick's move, as `Entity.checkInsideBlocks` sweeps it, so a mob falling past
 /// a flower is inside it on the way.
 pub(crate) fn flower_contact_effects(m: &mut Mob, w: &MobWorld) {
-    if !m.alive()
-        || ((w.difficulty.base == 0 || m.invulnerable_flag) && m.species() != Species::Bee)
-    {
+    use crate::blocks::hazard;
+    if !m.alive() || w.difficulty.base == 0 {
         return;
     }
+    let mut mask = 0u32;
+    if !m.invulnerable_flag {
+        mask |= hazard::WITHER_ROSE;
+    }
+    if m.species() == Species::Bee && !m.has_effect("minecraft:poison") {
+        mask |= hazard::OPEN_EYEBLOSSOM;
+    }
+    if mask == 0 {
+        return;
+    }
+    let (from, to) = (m.previous, m.position);
     let inset = f64::from(1.0e-5_f32);
-    let box_at_end = m
-        .bounds_at(m.position)
-        .deflate(Vec3::new(inset, inset, inset));
-    let _ = horizon_core::geometry::sweep_intersected_blocks(
-        m.previous,
-        m.position,
-        box_at_end,
-        1 << 22,
-        |p, _| {
-            match w.block_name(p.x, p.y, p.z) {
-                "minecraft:wither_rose" => {
-                    // World difficulty, not the regional one, and
-                    // isInvulnerableTo(wither) (the invulnerable
-                    // flag, not the hit timer); a wither and a wither
-                    // skeleton refuse the effect in `addEffect`.
-                    if w.difficulty.base != 0 && !m.invulnerable_flag {
-                        m.add_effect("minecraft:wither", 40, 0);
+    let box_at_end = m.bounds_at(to).deflate(Vec3::new(inset, inset, inset));
+    let stationary = from == to;
+    let gate_bounds = if stationary {
+        crate::motion::environment::closed_cell_bounds(box_at_end)
+    } else {
+        let box_at_start = box_at_end.move_by(from.subtract(to));
+        crate::motion::environment::swept_cell_bounds(box_at_start, box_at_end)
+    };
+    let Some((lo, hi)) = gate_bounds else {
+        return;
+    };
+    if !w.world.may_hold_hazard(lo, hi, w.facts, mask) {
+        return;
+    }
+    let mut visit = |x: i32, y: i32, z: i32| -> bool {
+        let h = w.facts.hazards(w.world.block(x, y, z));
+        if h & hazard::WITHER_ROSE != 0 {
+            // World difficulty, not the regional one, and
+            // isInvulnerableTo(wither) (the invulnerable
+            // flag, not the hit timer); a wither and a wither
+            // skeleton refuse the effect in `addEffect`.
+            if !m.invulnerable_flag {
+                m.add_effect("minecraft:wither", 40, 0);
+            }
+        } else if h & hazard::OPEN_EYEBLOSSOM != 0
+            && m.species() == Species::Bee
+            && super::bee::attracts_bees(w, [x, y, z])
+            && !m.has_effect("minecraft:poison")
+        {
+            m.add_effect("minecraft:poison", 25, 0);
+        }
+        // `checkInsideBlocks` stops the sweep once the entity is dead.
+        m.alive()
+    };
+    if stationary {
+        for z in lo[2]..=hi[2] {
+            for y in lo[1]..=hi[1] {
+                for x in lo[0]..=hi[0] {
+                    if !visit(x, y, z) {
+                        return;
                     }
                 }
-                "minecraft:open_eyeblossom"
-                    if w.difficulty.base != 0
-                        && m.species() == Species::Bee
-                        && super::bee::attracts_bees(w, [p.x, p.y, p.z])
-                        && !m.has_effect("minecraft:poison") =>
-                {
-                    m.add_effect("minecraft:poison", 25, 0);
-                }
-                _ => {}
             }
-            // `checkInsideBlocks` stops the sweep once the entity is dead.
-            m.alive()
-        },
-    );
+        }
+        return;
+    }
+    let _ =
+        horizon_core::geometry::sweep_intersected_blocks(from, to, box_at_end, 1 << 22, |p, _| {
+            visit(p.x, p.y, p.z)
+        });
 }
 
 /// `LivingEntity.tickEffects`: tick active effects in place, including the

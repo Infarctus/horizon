@@ -209,10 +209,33 @@ fn bubble_columns_touching(
         f64::from(1.0e-5f32),
         f64::from(1.0e-5f32),
     ));
-    let (lo, hi) = (b.min_position(), b.max_position());
-    for x in lo.x.floor() as i32..=(hi.x.ceil() as i32 - 1) {
-        for y in lo.y.floor() as i32..=(hi.y.ceil() as i32 - 1) {
-            for z in lo.z.floor() as i32..=(hi.z.ceil() as i32 - 1) {
+    let (min, max) = (b.min_position(), b.max_position());
+    if !min.is_finite() || !max.is_finite() {
+        return;
+    }
+    let lo = [
+        min.x.floor() as i32,
+        min.y.floor() as i32,
+        min.z.floor() as i32,
+    ];
+    let (Some(hi_x), Some(hi_y), Some(hi_z)) = (
+        (max.x.ceil() as i32).checked_sub(1),
+        (max.y.ceil() as i32).checked_sub(1),
+        (max.z.ceil() as i32).checked_sub(1),
+    ) else {
+        return;
+    };
+    let hi = [hi_x, hi_y, hi_z];
+    if lo[0] > hi[0]
+        || lo[1] > hi[1]
+        || lo[2] > hi[2]
+        || !world.may_hold_hazard(lo, hi, facts, crate::blocks::hazard::BUBBLE_COLUMN)
+    {
+        return;
+    }
+    for x in lo[0]..=hi[0] {
+        for y in lo[1]..=hi[1] {
+            for z in lo[2]..=hi[2] {
                 let pos = BlockPos::new(x, y, z);
                 if let Some(column) = bubble_column_at(world, registry, facts, collision, pos) {
                     each(pos, column);
@@ -252,7 +275,7 @@ pub fn bubble_column_at(
     pos: BlockPos,
 ) -> Option<BubbleColumn> {
     let state = world.block(pos.x, pos.y, pos.z);
-    if &*facts.get(state).name != "minecraft:bubble_column" {
+    if !facts.has_hazard(state, crate::blocks::hazard::BUBBLE_COLUMN) {
         return None;
     }
     let drag = registry

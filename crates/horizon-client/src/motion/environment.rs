@@ -176,7 +176,8 @@ impl MotionWorld<'_, '_, '_> {
             self.player.fire_ticks = 0;
             return Ok(());
         }
-        let damage = fire_contact(self.scene, self.assets.registry, self.player.bounds());
+        let damage =
+            fire_contact_by_registry(self.scene, self.assets.registry, self.player.bounds());
         if damage > 0.0 {
             self.player.ticks_frozen = 0;
             if !self.player.fluids.was_touching_water {
@@ -196,47 +197,125 @@ impl MotionWorld<'_, '_, '_> {
         Ok(())
     }
 }
-pub(crate) fn fire_contact(
-    world: &World,
-    registry: &horizon_world::registry::BlockRegistry,
-    bounds: Aabb,
-) -> f32 {
-    let b = bounds.deflate(Vec3::new(1e-5, 1e-5, 1e-5));
+/// Inclusive integer cell bounds covered by `bounds` (using `floor` on both ends,
+/// matching `BlockPos::between_closed_box`). Returns `None` when empty or non-finite.
+#[inline]
+pub(crate) fn closed_cell_bounds(bounds: Aabb) -> Option<([i32; 3], [i32; 3])> {
+    let (min, max) = (bounds.min_position(), bounds.max_position());
+    if !min.is_finite() || !max.is_finite() {
+        return None;
+    }
+    let lo = [
+        min.x.floor() as i32,
+        min.y.floor() as i32,
+        min.z.floor() as i32,
+    ];
+    let hi = [
+        max.x.floor() as i32,
+        max.y.floor() as i32,
+        max.z.floor() as i32,
+    ];
+    (lo[0] <= hi[0] && lo[1] <= hi[1] && lo[2] <= hi[2]).then_some((lo, hi))
+}
+
+/// Conservative inclusive integer cell bounds for a swept AABB between `start_box` and
+/// `end_box`, padded by one block on each face to cover boundary-clamped DDA steps in
+/// `sweep_intersected_blocks`.
+#[inline]
+pub(crate) fn swept_cell_bounds(start_box: Aabb, end_box: Aabb) -> Option<([i32; 3], [i32; 3])> {
+    let (lo, hi) = closed_cell_bounds(start_box.union_bounds(end_box))?;
+    Some((
+        [
+            lo[0].saturating_sub(1),
+            lo[1].saturating_sub(1),
+            lo[2].saturating_sub(1),
+        ],
+        [
+            hi[0].saturating_add(1),
+            hi[1].saturating_add(1),
+            hi[2].saturating_add(1),
+        ],
+    ))
+}
+
+pub(crate) fn fire_contact(world: &World, facts: &crate::blocks::BlockFacts, bounds: Aabb) -> f32 {
+    use crate::blocks::hazard;
+    let Some((lo, hi)) = closed_cell_bounds(bounds.deflate(Vec3::new(1e-5, 1e-5, 1e-5))) else {
+        return 0.0;
+    };
+    if !world.may_hold_hazard(lo, hi, facts, hazard::ANY_FIRE) {
+        return 0.0;
+    }
     let mut damage = 0.0f32;
-    for x in b.min_position().x.floor() as i32..=b.max_position().x.floor() as i32 {
-        for y in b.min_position().y.floor() as i32..=b.max_position().y.floor() as i32 {
-            for z in b.min_position().z.floor() as i32..=b.max_position().z.floor() as i32 {
-                damage = damage.max(
-                    match registry
-                        .state(world.block(x, y, z))
-                        .map(|s| s.name.as_str())
-                    {
-                        Some("minecraft:fire") => 1.0,
-                        Some("minecraft:soul_fire") => 2.0,
-                        _ => 0.0,
-                    },
-                );
+    for x in lo[0]..=hi[0] {
+        for y in lo[1]..=hi[1] {
+            for z in lo[2]..=hi[2] {
+                let h = facts.hazards(world.block(x, y, z));
+                if h & hazard::SOUL_FIRE != 0 {
+                    return 2.0;
+                }
+                if h & hazard::FIRE != 0 {
+                    damage = 1.0;
+                }
             }
         }
     }
     damage
 }
+
+fn fire_contact_by_registry(
+    world: &World,
+    registry: &horizon_world::registry::BlockRegistry,
+    bounds: Aabb,
+) -> f32 {
+    let Some((lo, hi)) = closed_cell_bounds(bounds.deflate(Vec3::new(1e-5, 1e-5, 1e-5))) else {
+        return 0.0;
+    };
+    if !world.may_hold(lo, hi, |s| {
+        matches!(
+            registry.state(s).map(|st| st.name.as_str()),
+            Some("minecraft:fire" | "minecraft:soul_fire")
+        )
+    }) {
+        return 0.0;
+    }
+    let mut damage = 0.0f32;
+    for x in lo[0]..=hi[0] {
+        for y in lo[1]..=hi[1] {
+            for z in lo[2]..=hi[2] {
+                match registry
+                    .state(world.block(x, y, z))
+                    .map(|s| s.name.as_str())
+                {
+                    Some("minecraft:soul_fire") => return 2.0,
+                    Some("minecraft:fire") => damage = 1.0,
+                    _ => {}
+                }
+            }
+        }
+    }
+    damage
+}
+
 /// `CactusBlock.entityInside`: the box (deflated by `1.0E-5`, as in
 /// `Entity.checkInsideBlocks`) touches a cactus; its inside shape is the
 /// whole block.
 pub(crate) fn cactus_contact(
     world: &World,
-    registry: &horizon_world::registry::BlockRegistry,
+    facts: &crate::blocks::BlockFacts,
     bounds: Aabb,
 ) -> bool {
-    let b = bounds.deflate(Vec3::new(1e-5, 1e-5, 1e-5));
-    for x in b.min_position().x.floor() as i32..=b.max_position().x.floor() as i32 {
-        for y in b.min_position().y.floor() as i32..=b.max_position().y.floor() as i32 {
-            for z in b.min_position().z.floor() as i32..=b.max_position().z.floor() as i32 {
-                if registry
-                    .state(world.block(x, y, z))
-                    .is_some_and(|s| s.name == "minecraft:cactus")
-                {
+    use crate::blocks::hazard;
+    let Some((lo, hi)) = closed_cell_bounds(bounds.deflate(Vec3::new(1e-5, 1e-5, 1e-5))) else {
+        return false;
+    };
+    if !world.may_hold_hazard(lo, hi, facts, hazard::CACTUS) {
+        return false;
+    }
+    for x in lo[0]..=hi[0] {
+        for y in lo[1]..=hi[1] {
+            for z in lo[2]..=hi[2] {
+                if facts.has_hazard(world.block(x, y, z), hazard::CACTUS) {
                     return true;
                 }
             }
