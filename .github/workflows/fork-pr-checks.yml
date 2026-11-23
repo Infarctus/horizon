@@ -407,12 +407,15 @@ jobs:
         run: |
           set -euo pipefail
           if [ -f tools/ci/check_warnings.py ]; then
-            python3 tools/ci/check_warnings.py
+            python3 tools/ci/check_warnings.py cargo clippy --locked --keep-going --workspace --all-targets
+            if [ "$SERVER_BUILD" = "true" ]; then
+              python3 tools/ci/check_warnings.py cargo clippy --locked -p horizon-client --no-default-features --all-targets
+            fi
           else
             cargo clippy --locked --workspace --all-targets -- -D warnings
-          fi
-          if [ "$SERVER_BUILD" = "true" ]; then
-            cargo clippy --locked -p horizon-client --no-default-features --all-targets -- -D warnings
+            if [ "$SERVER_BUILD" = "true" ]; then
+              cargo clippy --locked -p horizon-client --no-default-features --all-targets -- -D warnings
+            fi
           fi
 
   tests:
