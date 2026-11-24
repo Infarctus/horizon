@@ -309,12 +309,12 @@ jobs:
             rustup toolchain install stable --profile minimal --component rustfmt --component clippy
             rustup default stable
           fi
-          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold -Zthreads=4" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
 
       - name: Cache Cargo registry and build dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: fork-pr-checks-v1
+          shared-key: fork-pr-checks-tests-v1
           cache-on-failure: false
           save-if: ${{ needs.scope.outputs.rust == 'true' }}
 
@@ -400,14 +400,14 @@ jobs:
             rustup toolchain install stable --profile minimal --component rustfmt --component clippy
             rustup default stable
           fi
-          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold -Zthreads=4" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
 
-      - name: Restore shared Cargo dependency cache
+      - name: Cache clippy Cargo dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: fork-pr-checks-v1
+          shared-key: fork-pr-checks-clippy-v1
           cache-on-failure: false
-          save-if: false
+          save-if: true
 
       - name: Run workspace and server clippy
         env:
@@ -469,14 +469,14 @@ jobs:
             rustup toolchain install stable --profile minimal --component rustfmt --component clippy
             rustup default stable
           fi
-          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold -Zthreads=4" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
 
-      - name: Restore shared Cargo dependency cache
+      - name: Cache test Cargo dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: fork-pr-checks-v1
+          shared-key: fork-pr-checks-tests-v1
           cache-on-failure: false
-          save-if: false
+          save-if: ${{ inputs.mode == 'verify' }}
 
       - name: Run check and tests
         env:
@@ -572,7 +572,7 @@ jobs:
             rustup toolchain install stable --profile minimal --component rustfmt --component clippy
             rustup default stable
           fi
-          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold -Zthreads=4" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
 
       - name: Cache launcher workspace dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -627,7 +627,7 @@ jobs:
             rustup toolchain install stable --profile minimal --component rustfmt --component clippy
             rustup default stable
           fi
-          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold -Zthreads=4" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
 
       - name: Cache mod-api-gen dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -682,12 +682,12 @@ jobs:
             rustup toolchain install stable --profile minimal --component rustfmt --component clippy
             rustup default stable
           fi
-          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold -Zthreads=4" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
 
       - name: Restore shared Cargo registry cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: fork-pr-checks-v1
+          shared-key: fork-pr-checks-tests-v1
           cache-on-failure: false
           save-if: false
 
