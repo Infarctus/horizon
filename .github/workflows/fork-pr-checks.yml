@@ -267,7 +267,7 @@ jobs:
 
   pr-ready:
     name: "PR Ready (Self-check)"
-    needs: [scope, fast-checks]
+    needs: [scope]
     if: >-
       !cancelled() &&
       needs.scope.result == 'success' &&
