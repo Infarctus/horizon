@@ -47,6 +47,11 @@ on:
         required: false
         default: false
         type: boolean
+      fail_fast:
+        description: Gate pr-ready on fast-checks passing first (skip 30m Rust run on fast lint/fmt/Python failures)
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -61,6 +66,9 @@ env:
   WGPU_BACKEND: "dx12"
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # Keep Cargo.toml's [profile.dev] debug = "line-tables-only":
+  # crash::tests::the_debug_crash_is_reported_as_vanillas requires line tables,
+  # and uniform debuginfo maximizes sccache hit sharing across jobs.
 
 jobs:
   scope:
@@ -182,7 +190,7 @@ jobs:
           echo "Scope: rust=$rust_needed server=$server_needed launcher=$launcher_needed mod_api=$mod_api_needed touched=$touched"
 
   fast-checks:
-    name: "Fast checks (fmt, tree, layers, Python)"
+    name: "Fast checks (fmt, tree, layers, hotspots, Python)"
     needs: scope
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -209,7 +217,7 @@ jobs:
           git remote add upstream https://github.com/horizon-rust/horizon.git
           git fetch --no-tags --filter=blob:none upstream "refs/heads/${INPUT_BASE}:refs/remotes/upstream/${INPUT_BASE}"
 
-      - name: Run tree, layers, addresses, nested locks, rustfmt, and Python tests
+      - name: Run tree, hygiene, layers, addresses, hotspots, nested locks, rustfmt, and Python tests
         env:
           BASE_REF: ${{ needs.scope.outputs.base_ref }}
           MERGE_BASE: ${{ needs.scope.outputs.merge_base }}
@@ -220,8 +228,17 @@ jobs:
           export HORIZON_HOME="$scratch/home" XDG_DATA_HOME="$scratch/data" XDG_CONFIG_HOME="$scratch/config"
 
           python3 tools/check_public_tree.py
+          if [ -f tools/ci/check_repository_hygiene.py ]; then
+            python3 tools/ci/check_repository_hygiene.py
+          fi
           python3 tools/check_layers.py --base "$BASE_REF"
           python3 tools/check_addresses.py --base "$BASE_REF"
+          if [ -f tools/hotspots/check_lists.py ]; then
+            python3 tools/hotspots/check_lists.py
+          fi
+          if [ -f tools/hotspots/check_stand_ins.py ]; then
+            python3 tools/hotspots/check_stand_ins.py
+          fi
           if [ -f tools/ci/nested_locks.py ]; then
             python3 tools/ci/nested_locks.py --base "$MERGE_BASE"
           fi
@@ -250,15 +267,29 @@ jobs:
 
   pr-ready:
     name: "PR Ready (Self-check)"
-    needs: scope
-    if: inputs.mode == 'pr-ready' || inputs.mode == 'full'
+    needs: [scope, fast-checks]
+    if: >-
+      !cancelled() &&
+      needs.scope.result == 'success' &&
+      (inputs.mode == 'pr-ready' || inputs.mode == 'full') &&
+      (needs.fast-checks.result == 'success' || !inputs.fail_fast)
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - name: Free disk space on ubuntu-latest
+      - name: Ensure sufficient disk space on ubuntu-latest
         run: |
           set -euo pipefail
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/.ghcup
+          avail_gb=$(df -BG --output=avail / | tail -n 1 | tr -dc '0-9')
+          echo "Available disk space on /: ${avail_gb}G"
+          if [ "${avail_gb:-0}" -lt 40 ]; then
+            echo "Below 40G threshold; pruning preinstalled SDKs in parallel..."
+            sudo rm -rf /usr/share/dotnet &
+            sudo rm -rf /usr/local/lib/android &
+            sudo rm -rf /opt/ghc &
+            sudo rm -rf /opt/hostedtoolcache/CodeQL &
+            sudo rm -rf /usr/local/.ghcup &
+            wait
+          fi
           df -h /
 
       - name: Checkout target ref
@@ -311,11 +342,27 @@ jobs:
           fi
           echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
 
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+
+      - name: Configure sccache wrapper
+        run: |
+          set -euo pipefail
+          {
+            echo "SCCACHE_GHA_ENABLED=true"
+            if [ -f "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh" ]; then
+              chmod +x "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
+              echo "RUSTC_WRAPPER=$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
+            else
+              echo "RUSTC_WRAPPER=sccache"
+            fi
+          } >> "$GITHUB_ENV"
+
       - name: Cache Cargo registry and build dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: fork-pr-checks-tests-v1
-          cache-on-failure: false
+          shared-key: fork-pr-checks-pr-ready-v1
+          cache-on-failure: true
           save-if: ${{ needs.scope.outputs.rust == 'true' }}
 
       - name: Cache launcher workspace dependencies
@@ -324,7 +371,7 @@ jobs:
         with:
           workspaces: launcher
           shared-key: fork-pr-checks-launcher-v1
-          cache-on-failure: false
+          cache-on-failure: true
           save-if: ${{ needs.scope.outputs.launcher == 'true' }}
 
       - name: Run tools/pr_ready.py
@@ -375,10 +422,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - name: Free disk space on ubuntu-latest
+      - name: Ensure sufficient disk space on ubuntu-latest
         run: |
           set -euo pipefail
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/.ghcup
+          avail_gb=$(df -BG --output=avail / | tail -n 1 | tr -dc '0-9')
+          echo "Available disk space on /: ${avail_gb}G"
+          if [ "${avail_gb:-0}" -lt 40 ]; then
+            echo "Below 40G threshold; pruning preinstalled SDKs in parallel..."
+            sudo rm -rf /usr/share/dotnet &
+            sudo rm -rf /usr/local/lib/android &
+            sudo rm -rf /opt/ghc &
+            sudo rm -rf /opt/hostedtoolcache/CodeQL &
+            sudo rm -rf /usr/local/.ghcup &
+            wait
+          fi
           df -h /
 
       - name: Checkout target ref
@@ -402,11 +459,27 @@ jobs:
           fi
           echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
 
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+
+      - name: Configure sccache wrapper
+        run: |
+          set -euo pipefail
+          {
+            echo "SCCACHE_GHA_ENABLED=true"
+            if [ -f "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh" ]; then
+              chmod +x "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
+              echo "RUSTC_WRAPPER=$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
+            else
+              echo "RUSTC_WRAPPER=sccache"
+            fi
+          } >> "$GITHUB_ENV"
+
       - name: Cache clippy Cargo dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: fork-pr-checks-clippy-v1
-          cache-on-failure: false
+          cache-on-failure: true
           save-if: true
 
       - name: Run workspace and server clippy
@@ -436,10 +509,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - name: Free disk space on ubuntu-latest
+      - name: Ensure sufficient disk space on ubuntu-latest
         run: |
           set -euo pipefail
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/.ghcup
+          avail_gb=$(df -BG --output=avail / | tail -n 1 | tr -dc '0-9')
+          echo "Available disk space on /: ${avail_gb}G"
+          if [ "${avail_gb:-0}" -lt 40 ]; then
+            echo "Below 40G threshold; pruning preinstalled SDKs in parallel..."
+            sudo rm -rf /usr/share/dotnet &
+            sudo rm -rf /usr/local/lib/android &
+            sudo rm -rf /opt/ghc &
+            sudo rm -rf /opt/hostedtoolcache/CodeQL &
+            sudo rm -rf /usr/local/.ghcup &
+            wait
+          fi
           df -h /
 
       - name: Checkout target ref
@@ -471,11 +554,27 @@ jobs:
           fi
           echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
 
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+
+      - name: Configure sccache wrapper
+        run: |
+          set -euo pipefail
+          {
+            echo "SCCACHE_GHA_ENABLED=true"
+            if [ -f "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh" ]; then
+              chmod +x "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
+              echo "RUSTC_WRAPPER=$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
+            else
+              echo "RUSTC_WRAPPER=sccache"
+            fi
+          } >> "$GITHUB_ENV"
+
       - name: Cache test Cargo dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: fork-pr-checks-tests-v1
-          cache-on-failure: false
+          cache-on-failure: true
           save-if: ${{ inputs.mode == 'verify' }}
 
       - name: Run check and tests
@@ -534,10 +633,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Free disk space on ubuntu-latest
+      - name: Ensure sufficient disk space on ubuntu-latest
         run: |
           set -euo pipefail
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/.ghcup
+          avail_gb=$(df -BG --output=avail / | tail -n 1 | tr -dc '0-9')
+          echo "Available disk space on /: ${avail_gb}G"
+          if [ "${avail_gb:-0}" -lt 40 ]; then
+            echo "Below 40G threshold; pruning preinstalled SDKs in parallel..."
+            sudo rm -rf /usr/share/dotnet &
+            sudo rm -rf /usr/local/lib/android &
+            sudo rm -rf /opt/ghc &
+            sudo rm -rf /opt/hostedtoolcache/CodeQL &
+            sudo rm -rf /usr/local/.ghcup &
+            wait
+          fi
           df -h /
 
       - name: Checkout target ref
@@ -574,12 +683,28 @@ jobs:
           fi
           echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
 
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+
+      - name: Configure sccache wrapper
+        run: |
+          set -euo pipefail
+          {
+            echo "SCCACHE_GHA_ENABLED=true"
+            if [ -f "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh" ]; then
+              chmod +x "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
+              echo "RUSTC_WRAPPER=$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
+            else
+              echo "RUSTC_WRAPPER=sccache"
+            fi
+          } >> "$GITHUB_ENV"
+
       - name: Cache launcher workspace dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: launcher
           shared-key: fork-pr-checks-launcher-v1
-          cache-on-failure: false
+          cache-on-failure: true
           save-if: true
 
       - name: Check, clippy, and test launcher
@@ -601,10 +726,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Free disk space on ubuntu-latest
+      - name: Ensure sufficient disk space on ubuntu-latest
         run: |
           set -euo pipefail
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/.ghcup
+          avail_gb=$(df -BG --output=avail / | tail -n 1 | tr -dc '0-9')
+          echo "Available disk space on /: ${avail_gb}G"
+          if [ "${avail_gb:-0}" -lt 40 ]; then
+            echo "Below 40G threshold; pruning preinstalled SDKs in parallel..."
+            sudo rm -rf /usr/share/dotnet &
+            sudo rm -rf /usr/local/lib/android &
+            sudo rm -rf /opt/ghc &
+            sudo rm -rf /opt/hostedtoolcache/CodeQL &
+            sudo rm -rf /usr/local/.ghcup &
+            wait
+          fi
           df -h /
 
       - name: Checkout target ref
@@ -629,11 +764,27 @@ jobs:
           fi
           echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
 
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+
+      - name: Configure sccache wrapper
+        run: |
+          set -euo pipefail
+          {
+            echo "SCCACHE_GHA_ENABLED=true"
+            if [ -f "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh" ]; then
+              chmod +x "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
+              echo "RUSTC_WRAPPER=$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
+            else
+              echo "RUSTC_WRAPPER=sccache"
+            fi
+          } >> "$GITHUB_ENV"
+
       - name: Cache mod-api-gen dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: fork-pr-checks-mod-api-v1
-          cache-on-failure: false
+          cache-on-failure: true
           save-if: true
 
       - name: Run tools/check_mod_api_unchanged.py
@@ -657,10 +808,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - name: Free disk space on ubuntu-latest
+      - name: Ensure sufficient disk space on ubuntu-latest
         run: |
           set -euo pipefail
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/.ghcup
+          avail_gb=$(df -BG --output=avail / | tail -n 1 | tr -dc '0-9')
+          echo "Available disk space on /: ${avail_gb}G"
+          if [ "${avail_gb:-0}" -lt 40 ]; then
+            echo "Below 40G threshold; pruning preinstalled SDKs in parallel..."
+            sudo rm -rf /usr/share/dotnet &
+            sudo rm -rf /usr/local/lib/android &
+            sudo rm -rf /opt/ghc &
+            sudo rm -rf /opt/hostedtoolcache/CodeQL &
+            sudo rm -rf /usr/local/.ghcup &
+            wait
+          fi
           df -h /
 
       - name: Checkout target ref
@@ -683,6 +844,22 @@ jobs:
             rustup default stable
           fi
           echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+
+      - name: Configure sccache wrapper
+        run: |
+          set -euo pipefail
+          {
+            echo "SCCACHE_GHA_ENABLED=true"
+            if [ -f "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh" ]; then
+              chmod +x "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
+              echo "RUSTC_WRAPPER=$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
+            else
+              echo "RUSTC_WRAPPER=sccache"
+            fi
+          } >> "$GITHUB_ENV"
 
       - name: Restore shared Cargo registry cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
