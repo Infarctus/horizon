@@ -6,7 +6,7 @@ This orphan branch is the default branch of `Infarctus/horizon` solely to host f
 
 Every dispatch runs a lightweight `scope` job (~15s), then fans out across `ubuntu-latest` runners. Concurrency is grouped per `ref` (`fork-pr-checks-<ref>`), so overlapping dispatches on the same branch cancel earlier runs instead of duplicating work or contending for GitHub's cache API.
 
-- **`fast-checks`** (~1m, runs in separate named steps): public tree, repository hygiene, layers, addresses, hotspot lists (`check_lists.py`), hotspot stand-ins (`check_stand_ins.py`), nested locks, root & launcher rustfmt on changed files, and parallel Python unit tests.
+- **`fast-checks`** (~1m, non-short-circuiting named steps with a Job Summary table): public tree, repository hygiene, layers, addresses, root & launcher rustfmt on changed files, nested locks, hotspot lists (`check_lists.py`), hotspot stand-ins (`check_stand_ins.py`), and parallel Python unit tests. Every step runs so an unrelated failure on `main` never hides your rustfmt or Python test signal.
 - **`verify`** (`clippy` + `tests` + `launcher` + `mod-api` in parallel, ~12–15m): recommended while iterating.
 - **`pr-ready`** (`pr-ready`, `full`, ~35m serial): gated on `fast-checks` by default (`fail_fast=true`, override with `-f fail_fast=false` or `-f force_pr_ready=true`). Runs `tools/pr_ready.py --base upstream/main`, writes the scrubbed `## Self-check` Markdown block to Job Summary, and uploads `pr-ready-summary.md`. Run once at the end when ready to open or finalize a PR.
 - **`tests`** (`quick`, `full` with `--crates`/`--filter`): targeted `cargo check`/`cargo test` using the warm `tests` cache without overwriting it.

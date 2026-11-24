@@ -284,9 +284,13 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Public tree check
+        id: public_tree
+        continue-on-error: true
         run: python3 tools/check_public_tree.py
 
       - name: Repository hygiene check
+        id: repo_hygiene
+        continue-on-error: true
         run: |
           set -euo pipefail
           if [ -f tools/ci/check_repository_hygiene.py ]; then
@@ -294,39 +298,22 @@ jobs:
           fi
 
       - name: Layer check
+        id: layers
+        continue-on-error: true
         env:
           BASE_REF: ${{ needs.scope.outputs.base_ref }}
         run: python3 tools/check_layers.py --base "$BASE_REF"
 
       - name: Address check
+        id: addresses
+        continue-on-error: true
         env:
           BASE_REF: ${{ needs.scope.outputs.base_ref }}
         run: python3 tools/check_addresses.py --base "$BASE_REF"
 
-      - name: Hotspot lists check
-        run: |
-          set -euo pipefail
-          if [ -f tools/hotspots/check_lists.py ]; then
-            python3 tools/hotspots/check_lists.py
-          fi
-
-      - name: Hotspot stand-ins check
-        run: |
-          set -euo pipefail
-          if [ -f tools/hotspots/check_stand_ins.py ]; then
-            python3 tools/hotspots/check_stand_ins.py
-          fi
-
-      - name: Nested locks check
-        env:
-          MERGE_BASE: ${{ needs.scope.outputs.merge_base }}
-        run: |
-          set -euo pipefail
-          if [ -f tools/ci/nested_locks.py ]; then
-            python3 tools/ci/nested_locks.py --base "$MERGE_BASE"
-          fi
-
       - name: Rustfmt check (root workspace)
+        id: rustfmt_root
+        continue-on-error: true
         env:
           MERGE_BASE: ${{ needs.scope.outputs.merge_base }}
         run: |
@@ -342,6 +329,8 @@ jobs:
           fi
 
       - name: Rustfmt check (launcher)
+        id: rustfmt_launcher
+        continue-on-error: true
         env:
           MERGE_BASE: ${{ needs.scope.outputs.merge_base }}
         run: |
@@ -352,13 +341,81 @@ jobs:
             cargo fmt --manifest-path launcher/Cargo.toml -- --check
           fi
 
+      - name: Nested locks check
+        id: nested_locks
+        continue-on-error: true
+        env:
+          MERGE_BASE: ${{ needs.scope.outputs.merge_base }}
+        run: |
+          set -euo pipefail
+          if [ -f tools/ci/nested_locks.py ]; then
+            python3 tools/ci/nested_locks.py --base "$MERGE_BASE"
+          fi
+
+      - name: Hotspot lists check
+        id: hotspot_lists
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if [ -f tools/hotspots/check_lists.py ]; then
+            python3 tools/hotspots/check_lists.py
+          fi
+
+      - name: Hotspot stand-ins check
+        id: hotspot_stand_ins
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if [ -f tools/hotspots/check_stand_ins.py ]; then
+            python3 tools/hotspots/check_stand_ins.py
+          fi
+
       - name: Python unit tests
+        id: python_tests
+        continue-on-error: true
         run: |
           set -euo pipefail
           if [ -f tools/ci/unittest_parallel.py ]; then
             env -u GITHUB_REPOSITORY python3 tools/ci/unittest_parallel.py
           else
             env -u GITHUB_REPOSITORY python3 -m unittest discover -s tests
+          fi
+
+      - name: Summarize and gate fast-checks
+        env:
+          OUT_PUBLIC_TREE: ${{ steps.public_tree.outcome }}
+          OUT_REPO_HYGIENE: ${{ steps.repo_hygiene.outcome }}
+          OUT_LAYERS: ${{ steps.layers.outcome }}
+          OUT_ADDRESSES: ${{ steps.addresses.outcome }}
+          OUT_RUSTFMT_ROOT: ${{ steps.rustfmt_root.outcome }}
+          OUT_RUSTFMT_LAUNCHER: ${{ steps.rustfmt_launcher.outcome }}
+          OUT_NESTED_LOCKS: ${{ steps.nested_locks.outcome }}
+          OUT_HOTSPOT_LISTS: ${{ steps.hotspot_lists.outcome }}
+          OUT_HOTSPOT_STAND_INS: ${{ steps.hotspot_stand_ins.outcome }}
+          OUT_PYTHON_TESTS: ${{ steps.python_tests.outcome }}
+        run: |
+          set -euo pipefail
+          failed=0
+          {
+            echo "## Fast checks"
+            echo ""
+            echo "| Check | Outcome |"
+            echo "| --- | --- |"
+            for pair in               "Public tree:${OUT_PUBLIC_TREE}"               "Repository hygiene:${OUT_REPO_HYGIENE}"               "Layers:${OUT_LAYERS}"               "Addresses:${OUT_ADDRESSES}"               "Rustfmt (root changed files):${OUT_RUSTFMT_ROOT}"               "Rustfmt (launcher changed files):${OUT_RUSTFMT_LAUNCHER}"               "Nested locks:${OUT_NESTED_LOCKS}"               "Hotspot lists:${OUT_HOTSPOT_LISTS}"               "Hotspot stand-ins:${OUT_HOTSPOT_STAND_INS}"               "Python unit tests:${OUT_PYTHON_TESTS}"
+            do
+              name="${pair%%:*}"
+              outcome="${pair#*:}"
+              if [ "$outcome" = "success" ]; then
+                echo "| ${name} | ✅ pass |"
+              else
+                echo "| ${name} | ❌ ${outcome} |"
+                failed=1
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::One or more fast-checks failed; see the Fast checks summary table."
+            exit 1
           fi
 
   pr-ready:
