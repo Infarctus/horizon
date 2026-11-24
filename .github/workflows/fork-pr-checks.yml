@@ -52,6 +52,11 @@ on:
         required: false
         default: true
         type: boolean
+      force_pr_ready:
+        description: Force PR Ready (Self-check) to run immediately, bypassing fast-checks
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -192,6 +197,10 @@ jobs:
   fast-checks:
     name: "Fast checks (fmt, tree, layers, hotspots, Python)"
     needs: scope
+    if: >-
+      !cancelled() &&
+      needs.scope.result == 'success' &&
+      !inputs.force_pr_ready
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -267,12 +276,11 @@ jobs:
 
   pr-ready:
     name: "PR Ready (Self-check)"
-    needs: [scope]
+    needs: [scope, fast-checks]
     if: >-
       !cancelled() &&
       needs.scope.result == 'success' &&
-      (inputs.mode == 'pr-ready' || inputs.mode == 'full') &&
-      (needs.fast-checks.result == 'success' || !inputs.fail_fast)
+      (inputs.force_pr_ready || ((inputs.mode == 'pr-ready' || inputs.mode == 'full') && (needs.fast-checks.result == 'success' || !inputs.fail_fast)))
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
