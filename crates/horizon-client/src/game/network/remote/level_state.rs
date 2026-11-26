@@ -53,7 +53,8 @@ impl Game<'_> {
                     .collect()
             })
             .unwrap_or_default();
-        self.server_items = self.server_items(&registries);
+        let items = self.server_items(&registries);
+        self.set_server_items(items);
         if let Some(r) = self.remote.as_mut() {
             r.enchantments = enchantments;
             let bits = ceil_log2(biomes.len());

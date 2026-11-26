@@ -125,6 +125,56 @@ fn reloaded_tags_preserve_previous_binding_and_coefficients() {
     assert!(empty.get(BlockStateId(2)).is_err());
 }
 #[test]
+fn powder_snow_flag_is_preserved_across_rebind() {
+    let states = Tag::List(vec![
+        Tag::String("minecraft:stone".into()),
+        Tag::String("minecraft:powder_snow".into()),
+    ]);
+    let registry_nbt = Tag::compound([
+        ("DataVersion", Tag::Int(DATA_VERSION)),
+        ("states", states.clone()),
+        (
+            "defaults",
+            Tag::compound([
+                ("minecraft:stone", Tag::Int(0)),
+                ("minecraft:powder_snow", Tag::Int(1)),
+            ]),
+        ),
+    ]);
+    let definition = Tag::compound([
+        ("friction", Tag::Float(0.6f32.to_bits())),
+        ("speedFactor", Tag::Float(1f32.to_bits())),
+        ("jumpFactor", Tag::Float(1f32.to_bits())),
+        ("bounceRestitution", Tag::Float(0)),
+        ("fallDistanceReduction", Tag::Float(0)),
+        ("fenceGate", Tag::Byte(0)),
+    ]);
+    let movement = Tag::compound([
+        ("DataVersion", Tag::Int(DATA_VERSION)),
+        ("states", states),
+        (
+            "blocks",
+            Tag::compound([
+                ("minecraft:stone", definition.clone()),
+                ("minecraft:powder_snow", definition),
+            ]),
+        ),
+    ]);
+    let registry = BlockRegistry::from_nbt(&registry_nbt).unwrap();
+    let bound = MovementProperties::from_nbt(&movement, &registry)
+        .unwrap()
+        .bind(&MovementTags::default())
+        .unwrap();
+    assert!(!bound.get(BlockStateId(0)).unwrap().powder_snow);
+    assert!(bound.get(BlockStateId(1)).unwrap().powder_snow);
+    let mut tags = MovementTags::default();
+    tags.walls.insert("minecraft:stone".into());
+    let rebound = bound.rebind(&registry, &tags).unwrap();
+    assert!(!rebound.get(BlockStateId(0)).unwrap().powder_snow);
+    assert!(rebound.get(BlockStateId(0)).unwrap().wall);
+    assert!(rebound.get(BlockStateId(1)).unwrap().powder_snow);
+}
+#[test]
 fn provider_errors_and_unknown_states_remain_distinct() {
     struct Provider(bool);
     impl MovementBlockProvider for Provider {

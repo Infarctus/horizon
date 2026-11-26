@@ -196,6 +196,8 @@ pub(crate) fn hookless<'w>(base: &MobWorld<'w>) -> impl Fn() -> MobWorld<'w> + S
         asks_animal_tame: false,
         asks_living_destroy_block: false,
         asks_baby_spawn: false,
+        // Parallel preparation stays disabled whenever any native mod is loaded
+        // (`mob_islands.rs`), so no `IsLadder` block hook can be registered here.
         asks_is_ladder: false,
         who_lookup: None,
         foreign: None,

@@ -801,6 +801,7 @@ impl Game<'_> {
         if let Some(mut r) = self.remote.take() {
             r.session.disconnect();
         }
+        self.set_server_items(None);
         super::super::lan::sync::forget_sync_data();
         self.gui.atlas.clear_object_skins();
         if transferring {

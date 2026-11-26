@@ -66,13 +66,13 @@ impl ClimbingState {
     #[inline]
     pub fn open_trapdoor_facing(self) -> Option<u8> {
         let encoded = (self.0 >> Self::TRAPDOOR_SHIFT) & Self::FACING_MASK;
-        (encoded != 0).then(|| encoded - 1)
+        encoded.checked_sub(1)
     }
 
     #[inline]
     pub fn ladder_facing(self) -> Option<u8> {
         let encoded = (self.0 >> Self::LADDER_SHIFT) & Self::FACING_MASK;
-        (encoded != 0).then(|| encoded - 1)
+        encoded.checked_sub(1)
     }
 }
 

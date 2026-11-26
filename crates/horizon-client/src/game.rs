@@ -26,6 +26,24 @@ macro_rules! world_items {
         }
     };
 }
+macro_rules! world_movement {
+    ($s:ident) => {
+        match (&$s.server_motion, &$s.world_tables) {
+            (Some(s), _) => &s.movement,
+            (None, Some(t)) => &t.movement,
+            (None, None) => &$s.motion.blocks,
+        }
+    };
+}
+macro_rules! world_climbing {
+    ($s:ident) => {
+        match (&$s.server_motion, &$s.world_tables) {
+            (Some(s), _) => &s.climbing,
+            (None, Some(t)) => &t.climbing,
+            (None, None) => &$s.motion.climbing,
+        }
+    };
+}
 macro_rules! world_recipes {
     ($s:ident) => {
         match &$s.world_tables {
@@ -678,6 +696,13 @@ struct WorldRest {
     /// `SpinAttackEffectModel` (Riptide's spinning boxes).
     spin_attack: Option<horizon_client::mobs::Part>,
     stations: horizon_client::stations::StationData,
+}
+
+/// Movement and climbing state tables rebound from `server_items` (remote
+/// `ClientboundUpdateTagsPacket` overrides, matching `world_items!`).
+struct ServerMotionTables {
+    movement: horizon_world::movement_properties::BoundMovementProperties,
+    climbing: horizon_world::climbing::ClimbingRegistry<'static>,
 }
 
 /// The content tables a world's data packs change, loaded when the world
@@ -1466,6 +1491,9 @@ struct Game<'a> {
     /// Server-owned loot and item snapshots, independent of client preloads.
     server_loot: horizon_client::structure_blocks::LootSnapshot,
     server_items: Option<Arc<Items>>,
+    /// Movement and climbing state tables rebound against `server_items`
+    /// (remote `ClientboundUpdateTagsPacket` overrides, matching `world_items!`).
+    server_motion: Option<ServerMotionTables>,
     /// The world is superflat (`ServerLevel.isFlat`, for every dimension).
     world_flat: bool,
     /// The world is the Debug preset (`Level.isDebug`, for every dimension): its blocks
@@ -6655,7 +6683,7 @@ impl Game<'_> {
         // The save screen has finished every write before releasing storage.
         self.ui.dispatcher = Default::default();
         self.server_loot.set(None);
-        self.server_items = None;
+        self.set_server_items(None);
         self.session_lock = None;
         self.clear_world_parts();
         self.world_adopted = false;
@@ -11648,6 +11676,7 @@ impl<'a> Game<'a> {
             world_tables: None,
             server_loot: Default::default(),
             server_items: None,
+            server_motion: None,
             cmds: Default::default(),
             reload_resources: Default::default(),
             ui: chat::UiState::new(),

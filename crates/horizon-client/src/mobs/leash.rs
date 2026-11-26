@@ -136,7 +136,10 @@ pub fn holder_state(w: &MobWorld, holder: Holder) -> Option<HolderState> {
             .find(|(boat, _)| *boat == id)
             .map(|(_, state)| *state),
         Holder::Knot(pos) => {
-            let fence = w.has_tag("minecraft:fences", w.block_name(pos[0], pos[1], pos[2]));
+            let fence = w
+                .movement
+                .get(w.world.block(pos[0], pos[1], pos[2]))
+                .is_ok_and(|b| b.fence);
             fence.then(|| knot_state(pos))
         }
     }

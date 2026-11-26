@@ -767,11 +767,7 @@ impl Game<'_> {
             self.res.facts(),
             &self.res.motion().fluids,
             Some(self.border.geometry()),
-            Some(
-                self.world_tables
-                    .as_ref()
-                    .map_or(&self.res.motion().blocks, |t| &t.movement),
-            ),
+            Some(world_movement!(self)),
         );
         self.tnts.retain_mut(|t| {
             // A fluid lookup that fails leaves it where its move put it.

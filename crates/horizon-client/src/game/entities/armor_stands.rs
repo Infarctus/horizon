@@ -1200,9 +1200,7 @@ impl Game<'_> {
                 self.pack.assets.registry,
                 self.res.facts(),
                 self.collision,
-                self.world_tables
-                    .as_ref()
-                    .map_or(&self.res.motion().climbing, |t| &t.climbing),
+                world_climbing!(self),
             );
             let mut scene = horizon_client::collisions::SceneCollisions {
                 world,

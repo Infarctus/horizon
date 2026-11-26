@@ -20,7 +20,8 @@ impl Game<'_> {
             Arc::make_mut(&mut r.registries).add_tags(tags);
         }
         if let Some(r) = self.remote.as_ref() {
-            self.server_items = self.server_items(&r.registries);
+            let items = self.server_items(&r.registries);
+            self.set_server_items(items);
         }
         self.invalidate_tagged_shader_ids();
         self.refresh_infiniburn();

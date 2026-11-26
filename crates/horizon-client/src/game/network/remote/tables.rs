@@ -122,5 +122,10 @@ mod tests {
             ["minecraft:stick", "minecraft:oak_planks"]
         );
         assert!(items.item_tags["minecraft:planks"].contains("minecraft:stick"));
+        let registry = game.pack.assets.registry;
+        let stone = registry.default_state("minecraft:stone").unwrap();
+        let oak_fence = registry.default_state("minecraft:oak_fence").unwrap();
+        assert!(game.world_climbing().get(stone).unwrap().is_climbable());
+        assert!(!game.world_movement().get(oak_fence).unwrap().fence);
     }
 }

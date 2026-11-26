@@ -236,14 +236,57 @@ impl Game<'_> {
     pub(super) fn world_movement(
         &self,
     ) -> &horizon_world::movement_properties::BoundMovementProperties {
-        self.world_tables
-            .as_ref()
-            .map_or(&self.motion.blocks, |t| &t.movement)
+        world_movement!(self)
     }
     pub(super) fn world_climbing(&self) -> &horizon_world::climbing::ClimbingRegistry<'static> {
-        self.world_tables
-            .as_ref()
-            .map_or(&self.motion.climbing, |t| &t.climbing)
+        world_climbing!(self)
+    }
+    pub(super) fn build_motion_tables(
+        &self,
+        items: &Items,
+    ) -> Result<(
+        horizon_world::movement_properties::BoundMovementProperties,
+        horizon_world::climbing::ClimbingRegistry<'static>,
+    )> {
+        let registry = self.pack.assets.registry;
+        let block_tag_set = |name: &str| -> std::collections::BTreeSet<String> {
+            items
+                .block_tags
+                .get(name)
+                .into_iter()
+                .flatten()
+                .filter(|block| registry.default_state(block).is_some())
+                .cloned()
+                .collect()
+        };
+        let movement = self.motion.blocks.rebind(
+            registry,
+            &horizon_world::movement_properties::MovementTags {
+                fences: block_tag_set("minecraft:fences"),
+                walls: block_tag_set("minecraft:walls"),
+                suppresses_bounce: block_tag_set("minecraft:suppresses_bounce"),
+            },
+        )?;
+        let climbing = horizon_world::climbing::ClimbingRegistry::new(
+            registry,
+            &horizon_client::motion::trapdoor_blocks(self.res.facts()),
+            &block_tag_set("minecraft:climbable"),
+            &block_tag_set("minecraft:can_glide_through"),
+        )?;
+        Ok((movement, climbing))
+    }
+    pub(super) fn set_server_items(&mut self, items: Option<Arc<Items>>) {
+        self.server_motion =
+            items
+                .as_deref()
+                .and_then(|items| match self.build_motion_tables(items) {
+                    Ok((movement, climbing)) => Some(ServerMotionTables { movement, climbing }),
+                    Err(error) => {
+                        log::warn!("Horizon: failed to rebind server motion tables: {error}");
+                        None
+                    }
+                });
+        self.server_items = items;
     }
     pub(super) fn mob_suffocation(
         &self,
@@ -387,32 +430,7 @@ impl Game<'_> {
             root,
             &overlay,
         );
-        let registry = self.pack.assets.registry;
-        let block_tag_set = |name: &str| -> Result<std::collections::BTreeSet<String>> {
-            let members = items
-                .block_tags
-                .get(name)
-                .ok_or_else(|| format!("missing motion block tag {name}"))?;
-            Ok(members
-                .iter()
-                .filter(|block| registry.default_state(block).is_some())
-                .cloned()
-                .collect())
-        };
-        let movement = self.motion.blocks.rebind(
-            registry,
-            &horizon_world::movement_properties::MovementTags {
-                fences: block_tag_set("minecraft:fences")?,
-                walls: block_tag_set("minecraft:walls")?,
-                suppresses_bounce: block_tag_set("minecraft:suppresses_bounce")?,
-            },
-        )?;
-        let climbing = horizon_world::climbing::ClimbingRegistry::new(
-            registry,
-            &horizon_client::motion::trapdoor_blocks(self.res.facts()),
-            &block_tag_set("minecraft:climbable")?,
-            &block_tag_set("minecraft:can_glide_through")?,
-        )?;
+        let (movement, climbing) = self.build_motion_tables(&items)?;
         let causes_suffocation = items
             .block_tags
             .get("minecraft:causes_suffocation")
@@ -651,7 +669,7 @@ impl Game<'_> {
         self.send_datapack_snapshots();
         self.refresh_recipe_property_context();
         self.structure_spawns = structure_spawns;
-        self.server_items = None;
+        self.set_server_items(None);
         self.refresh_infiniburn();
         self.install_parts(parts);
         self.invalidate_tagged_shader_ids();
@@ -715,7 +733,7 @@ impl Game<'_> {
     }
     /// Build and publish one server snapshot for this world load or reload.
     pub(super) fn load_server_loot(&mut self) {
-        self.server_items = None;
+        self.set_server_items(None);
         let overlay = pack_files(&self.world_tables);
         let loot = if mod_api::__private::mods().is_empty() {
             horizon_client::structure_blocks::world_loot_data(
@@ -759,7 +777,7 @@ impl Game<'_> {
         {
             let mut items = self.items().clone();
             items.set_loot_tables(loot.tables().clone());
-            self.server_items = Some(Arc::new(items));
+            self.set_server_items(Some(Arc::new(items)));
         }
         self.server_loot.set(loot);
     }
