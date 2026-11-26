@@ -52,6 +52,11 @@ on:
         required: false
         default: true
         type: boolean
+      skip_fast_checks:
+        description: Skip the fast-checks job in any mode (verify, quick, pr-ready, full)
+        required: false
+        default: false
+        type: boolean
       force_pr_ready:
         description: Force PR Ready (Self-check) to run immediately in pr-ready/full mode, bypassing fast-checks
         required: false
@@ -76,12 +81,8 @@ env:
   WGPU_BACKEND: "dx12"
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  # Matches .cargo/config.toml so -Zthreads=4 also works in temp /tmp workspaces
-  # spawned by Python tests (test_pr_ready.py, test_check_layers.py).
-  RUSTC_BOOTSTRAP: "1"
-  # Cap concurrent rustc jobs to 2 (2 x -Zthreads=4 = 8 frontend threads on 4 vCPUs)
-  # to avoid OOM/SIGTERM (exit 143) when linking horizon-client test binaries on 16 GiB runners.
-  CARGO_BUILD_JOBS: "2"
+  # Cap concurrent rustc jobs to 3 to keep peak memory comfortable on 16 GiB runners.
+  CARGO_BUILD_JOBS: "3"
   # Keep Cargo.toml's [profile.dev] debug = "line-tables-only":
   # crash::tests::the_debug_crash_is_reported_as_vanillas requires line tables,
   # and uniform debuginfo maximizes cache hit sharing across jobs.
@@ -246,6 +247,7 @@ jobs:
     if: >-
       !cancelled() &&
       needs.scope.result == 'success' &&
+      !inputs.skip_fast_checks &&
       !(inputs.force_pr_ready && (inputs.mode == 'pr-ready' || inputs.mode == 'full'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -431,7 +433,7 @@ jobs:
       !cancelled() &&
       needs.scope.result == 'success' &&
       (inputs.mode == 'pr-ready' || inputs.mode == 'full') &&
-      (inputs.force_pr_ready || !inputs.fail_fast || needs.fast-checks.result == 'success')
+      (inputs.skip_fast_checks || inputs.force_pr_ready || !inputs.fail_fast || needs.fast-checks.result == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -514,7 +516,7 @@ jobs:
             rustup toolchain install stable --profile minimal --component rustfmt --component clippy
             rustup default stable
           fi
-          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold -Zthreads=4" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
 
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
@@ -655,7 +657,7 @@ jobs:
             rustup toolchain install stable --profile minimal --component rustfmt --component clippy
             rustup default stable
           fi
-          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold -Zthreads=4" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
 
       - name: Cache clippy Cargo dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -743,7 +745,7 @@ jobs:
             rustup toolchain install stable --profile minimal --component rustfmt --component clippy
             rustup default stable
           fi
-          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold -Zthreads=4" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
 
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
@@ -881,7 +883,7 @@ jobs:
             rustup toolchain install stable --profile minimal --component rustfmt --component clippy
             rustup default stable
           fi
-          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold -Zthreads=4" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
 
       - name: Cache launcher workspace dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -955,7 +957,7 @@ jobs:
             rustup toolchain install stable --profile minimal --component rustfmt --component clippy
             rustup default stable
           fi
-          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold -Zthreads=4" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
 
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
@@ -1053,7 +1055,7 @@ jobs:
             rustup toolchain install stable --profile minimal --component rustfmt --component clippy
             rustup default stable
           fi
-          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold -Zthreads=4" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
 
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
