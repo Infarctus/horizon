@@ -100,6 +100,9 @@ jobs:
       server_build: ${{ steps.inspect.outputs.server_build }}
       launcher: ${{ steps.inspect.outputs.launcher }}
       mod_api: ${{ steps.inspect.outputs.mod_api }}
+      theme: ${{ steps.inspect.outputs.theme }}
+      dispatch_tests: ${{ steps.inspect.outputs.dispatch_tests }}
+      mod_registry: ${{ steps.inspect.outputs.mod_registry }}
       touched_crates: ${{ steps.inspect.outputs.touched_crates }}
     steps:
       - name: Validate inputs
@@ -196,22 +199,30 @@ jobs:
           launcher_needed="${launcher_needed:-true}"
           mod_api_needed="${mod_api_needed:-true}"
 
-          touched="$(python3 - "$BASE_REF" <<'PY'
+          eval "$(python3 - "$BASE_REF" <<'PY'
+          import shlex
           import sys
           sys.path.insert(0, ".")
           from tools import parity, pr_ready
 
           changed = parity.changed_files(sys.argv[1]) or []
+          theme_needed = any(p.startswith(("crates/horizon-theme/", "xtask/")) for p in changed)
+          dispatch_inputs = getattr(pr_ready, "DISPATCH_TEST_INPUTS", ("crates/horizon-mod-api-gen/", "crates/horizon-mod-api-macros/", "crates/horizon-mod-api/", "crates/horizon-mod-vocab/"))
+          dispatch_needed = any(p.startswith(dispatch_inputs) for p in changed)
+          mod_registry_needed = any(p.startswith("crates/horizon-mod-registry/") for p in changed)
+
           if not any(pr_ready.workspace_rust(p) for p in changed):
-              print("__NONE__")
-              sys.exit(0)
-          crates_of, _, _ = pr_ready.packages()
-          crates = pr_ready.touched_crates(changed, crates_of)
-          # Match pr_ready.py: workspace Rust changed with empty crate list -> full workspace.
-          if crates is None or not crates:
-              print("__WORKSPACE__")
+              touched = "__NONE__"
           else:
-              print(" ".join(crates))
+              crates_of, _, _ = pr_ready.packages()
+              crates = pr_ready.touched_crates(changed, crates_of)
+              # Match pr_ready.py: workspace Rust changed with empty crate list -> full workspace.
+              touched = "__WORKSPACE__" if (crates is None or not crates) else " ".join(crates)
+
+          print(f"touched={shlex.quote(touched)}")
+          print(f"theme_needed={'true' if theme_needed else 'false'}")
+          print(f"dispatch_tests_needed={'true' if dispatch_needed else 'false'}")
+          print(f"mod_registry_needed={'true' if mod_registry_needed else 'false'}")
           PY
           )"
 
@@ -225,6 +236,9 @@ jobs:
             echo "server_build=$server_needed"
             echo "launcher=$launcher_needed"
             echo "mod_api=$mod_api_needed"
+            echo "theme=$theme_needed"
+            echo "dispatch_tests=$dispatch_tests_needed"
+            echo "mod_registry=$mod_registry_needed"
             echo "touched_crates=$touched"
           } >> "$GITHUB_OUTPUT"
 
@@ -297,6 +311,26 @@ jobs:
             echo "XDG_DATA_HOME=$scratch/data"
             echo "XDG_CONFIG_HOME=$scratch/config"
           } >> "$GITHUB_ENV"
+
+      - name: Cargo.lock check
+        id: cargo_lock
+        continue-on-error: true
+        env:
+          BASE_REF: ${{ needs.scope.outputs.base_ref }}
+        run: |
+          set -euo pipefail
+          python3 - "$BASE_REF" <<'PY'
+          import sys
+          sys.path.insert(0, ".")
+          from tools import parity, pr_ready
+
+          changed = parity.changed_files(sys.argv[1]) or []
+          problem = pr_ready.lock_problem(changed)
+          if problem:
+              print(f"::error::{problem}", file=sys.stderr)
+              sys.exit(1)
+          print("Cargo.lock check passed.")
+          PY
 
       - name: Public tree check
         id: public_tree
@@ -447,6 +481,7 @@ jobs:
 
       - name: Summarize and gate fast-checks
         env:
+          OUT_CARGO_LOCK: ${{ steps.cargo_lock.outcome }}
           OUT_PUBLIC_TREE: ${{ steps.public_tree.outcome }}
           OUT_REPO_HYGIENE: ${{ steps.repo_hygiene.outcome }}
           OUT_LAYERS: ${{ steps.layers.outcome }}
@@ -466,6 +501,7 @@ jobs:
             echo "| Check | Outcome |"
             echo "| --- | --- |"
             for pair in \
+              "Cargo.lock:${OUT_CARGO_LOCK}" \
               "Public tree:${OUT_PUBLIC_TREE}" \
               "Repository hygiene:${OUT_REPO_HYGIENE}" \
               "Layers:${OUT_LAYERS}" \
@@ -738,7 +774,7 @@ jobs:
     name: "Rust tests (${{ inputs.mode }})"
     needs: scope
     if: >-
-      (inputs.mode == 'verify' && needs.scope.outputs.rust == 'true') ||
+      (inputs.mode == 'verify' && (needs.scope.outputs.rust == 'true' || needs.scope.outputs.theme == 'true' || needs.scope.outputs.dispatch_tests == 'true' || needs.scope.outputs.mod_registry == 'true')) ||
       (inputs.mode == 'quick' && (inputs.crates != '' || inputs.test_filter != '' || needs.scope.outputs.rust == 'true')) ||
       (inputs.mode == 'full' && (inputs.crates != '' || inputs.test_filter != ''))
     runs-on: ubuntu-latest
@@ -818,6 +854,9 @@ jobs:
           INPUT_TEST_FILTER: ${{ inputs.test_filter }}
           INPUT_RUN_IGNORED: ${{ inputs.run_ignored }}
           TOUCHED_CRATES: ${{ needs.scope.outputs.touched_crates }}
+          SCOPE_THEME: ${{ needs.scope.outputs.theme }}
+          SCOPE_DISPATCH_TESTS: ${{ needs.scope.outputs.dispatch_tests }}
+          SCOPE_MOD_REGISTRY: ${{ needs.scope.outputs.mod_registry }}
         run: |
           set -euo pipefail
           crate_args=()
@@ -825,58 +864,69 @@ jobs:
           need_holder_actor=false
           need_mod_package_index=false
           selection="${INPUT_CRATES:-$TOUCHED_CRATES}"
+          rc=0
+          run_root_tests=true
           if [ "$selection" = "__NONE__" ]; then
             if [ -n "$INPUT_TEST_FILTER" ]; then
               selection="__WORKSPACE__"
             else
-              echo "No root-workspace Rust crates selected; nothing to test."
-              exit 0
+              run_root_tests=false
             fi
           fi
-          if [ "$selection" = "__WORKSPACE__" ] || [ -z "$selection" ]; then
-            crate_args=(--workspace)
-            need_holder_actor=true
-          else
-            for c in $selection; do
-              if [ "$c" = "horizon-mod-package" ]; then
-                need_holder_actor=true
-                need_mod_package_index=true
-              fi
-              selected_crates+=("$c")
-              crate_args+=(-p "$c")
-            done
-          fi
 
-          if [ "$need_holder_actor" = "true" ]; then
-            cargo build --locked -p horizon-mod-package --features runtime-process --example holder_actor
-          fi
-
-          if [ "$INPUT_MODE" = "quick" ] && [ -z "$INPUT_TEST_FILTER" ]; then
-            echo "Running cargo check --locked ${crate_args[*]} --all-targets"
-            cargo check --locked "${crate_args[@]}" --all-targets
-          fi
-
-          test_cmd=(cargo test --locked "${crate_args[@]}" --lib --bins --tests)
-          if [ "$need_mod_package_index" = "true" ]; then
-            test_cmd+=(--features horizon-mod-package/index)
-          fi
-          if [ -n "$INPUT_TEST_FILTER" ]; then
-            read -r -a filter_args <<< "$INPUT_TEST_FILTER"
-            test_cmd+=("${filter_args[@]}")
-          fi
-          if [ "$INPUT_RUN_IGNORED" = "true" ]; then
-            test_cmd+=(-- --ignored)
-          fi
-          echo "Running ${test_cmd[*]}"
-          "${test_cmd[@]}"
-
-          if [ "$INPUT_MODE" = "verify" ] && [ -z "$INPUT_TEST_FILTER" ]; then
-            if [ "${crate_args[0]}" = "--workspace" ]; then
-              doc_cmd=(cargo test --locked --workspace --doc)
-              echo "Running ${doc_cmd[*]}"
-              "${doc_cmd[@]}"
+          if [ "$run_root_tests" = "true" ]; then
+            if [ "$selection" = "__WORKSPACE__" ] || [ -z "$selection" ]; then
+              crate_args=(--workspace)
+              need_holder_actor=true
             else
-              mapfile -t doc_crates < <(python3 - "${selected_crates[@]}" <<'PY'
+              for c in $selection; do
+                if [ "$c" = "horizon-mod-package" ]; then
+                  need_holder_actor=true
+                  need_mod_package_index=true
+                fi
+                selected_crates+=("$c")
+                crate_args+=(-p "$c")
+              done
+            fi
+
+            if [ "$need_holder_actor" = "true" ]; then
+              cargo build --locked -p horizon-mod-package --features runtime-process --example holder_actor
+            fi
+
+            if [ "$INPUT_MODE" = "quick" ] && [ -z "$INPUT_TEST_FILTER" ]; then
+              echo "Running cargo check --locked ${crate_args[*]} --all-targets"
+              cargo check --locked "${crate_args[@]}" --all-targets
+            fi
+
+            test_cmd=(cargo test --locked "${crate_args[@]}" --lib --bins --tests)
+            if [ "$need_mod_package_index" = "true" ]; then
+              test_cmd+=(--features horizon-mod-package/index)
+            fi
+            if [ -n "$INPUT_TEST_FILTER" ]; then
+              read -r -a filter_args <<< "$INPUT_TEST_FILTER"
+              test_cmd+=("${filter_args[@]}")
+            fi
+            if [ "$INPUT_RUN_IGNORED" = "true" ]; then
+              test_cmd+=(-- --ignored)
+            fi
+
+            if [ "$INPUT_MODE" = "verify" ] && [ "${crate_args[0]}" = "--workspace" ] && [ -z "$INPUT_TEST_FILTER" ] && [ "$INPUT_RUN_IGNORED" != "true" ] && [ -f tools/ci/run_test_binaries.py ]; then
+              echo "Building workspace test binaries (--no-run)..."
+              "${test_cmd[@]}" --no-run
+              echo "Running workspace test binaries in parallel (--jobs 2)..."
+              python3 tools/ci/run_test_binaries.py --jobs 2 -- "${test_cmd[@]}" || rc=1
+            else
+              echo "Running ${test_cmd[*]}"
+              "${test_cmd[@]}" || rc=1
+            fi
+
+            if [ "$INPUT_MODE" = "verify" ] && [ -z "$INPUT_TEST_FILTER" ]; then
+              if [ "${crate_args[0]}" = "--workspace" ]; then
+                doc_cmd=(cargo test --locked --workspace --doc)
+                echo "Running ${doc_cmd[*]}"
+                "${doc_cmd[@]}" || rc=1
+              else
+                mapfile -t doc_crates < <(python3 - "${selected_crates[@]}" <<'PY'
           import json
           import subprocess
           import sys
@@ -887,20 +937,48 @@ jobs:
               if pkg["name"] in wanted and any("lib" in t["kind"] for t in pkg["targets"]):
                   print(pkg["name"])
           PY
-              )
-              if [ "${#doc_crates[@]}" -gt 0 ]; then
-                doc_cmd=(cargo test --locked)
-                for c in "${doc_crates[@]}"; do
-                  doc_cmd+=(-p "$c")
-                done
-                doc_cmd+=(--doc)
-                echo "Running ${doc_cmd[*]}"
-                "${doc_cmd[@]}"
-              else
-                echo "No library targets in selected crates; skipping --doc tests."
+                )
+                if [ "${#doc_crates[@]}" -gt 0 ]; then
+                  doc_cmd=(cargo test --locked)
+                  for c in "${doc_crates[@]}"; do
+                    doc_cmd+=(-p "$c")
+                  done
+                  doc_cmd+=(--doc)
+                  echo "Running ${doc_cmd[*]}"
+                  "${doc_cmd[@]}" || rc=1
+                else
+                  echo "No library targets in selected crates; skipping --doc tests."
+                fi
               fi
             fi
           fi
+
+          if [ "$INPUT_MODE" = "verify" ] && [ -z "$INPUT_TEST_FILTER" ]; then
+            if [ "$SCOPE_THEME" = "true" ]; then
+              echo "Running tokens_css_is_up_to_date..."
+              cargo test --locked -p horizon-theme --lib tokens_css_is_up_to_date || rc=1
+            fi
+            if [ "$SCOPE_DISPATCH_TESTS" = "true" ] && [ -f crates/horizon-mod-api-gen/dispatch-tests/Cargo.toml ]; then
+              echo "Running dispatch-tests clippy and tests..."
+              if [ -f tools/ci/check_warnings.py ]; then
+                python3 tools/ci/check_warnings.py cargo clippy --keep-going --manifest-path crates/horizon-mod-api-gen/dispatch-tests/Cargo.toml --all-targets --locked || rc=1
+              else
+                cargo clippy --manifest-path crates/horizon-mod-api-gen/dispatch-tests/Cargo.toml --all-targets --locked -- -D warnings || rc=1
+              fi
+              cargo test --manifest-path crates/horizon-mod-api-gen/dispatch-tests/Cargo.toml --locked -- --test-threads=4 || rc=1
+            fi
+            if [ "$SCOPE_MOD_REGISTRY" = "true" ] && [ -f crates/horizon-mod-registry/Cargo.toml ]; then
+              echo "Running horizon-mod-registry clippy and tests..."
+              if [ -f tools/ci/check_warnings.py ]; then
+                python3 tools/ci/check_warnings.py cargo clippy --keep-going --manifest-path crates/horizon-mod-registry/Cargo.toml --all-targets --locked || rc=1
+              else
+                cargo clippy --manifest-path crates/horizon-mod-registry/Cargo.toml --all-targets --locked -- -D warnings || rc=1
+              fi
+              cargo test --manifest-path crates/horizon-mod-registry/Cargo.toml --locked -- --test-threads=4 || rc=1
+            fi
+          fi
+
+          exit "$rc"
 
   launcher:
     name: "Launcher (verify)"
