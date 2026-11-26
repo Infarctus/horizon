@@ -1216,6 +1216,7 @@ pub fn main() -> horizon_client::Result<()> {
                     fluid_tables: &motion.fluids,
                     attributes: &motion.attributes,
                     movement: &motion.blocks,
+                    climbing: &motion.climbing,
                     collision: &collision,
                     suffocation: &suffocation,
                     data: &data,
@@ -1264,6 +1265,7 @@ pub fn main() -> horizon_client::Result<()> {
                     asks_animal_tame: false,
                     asks_living_destroy_block: false,
                     asks_baby_spawn: false,
+                    asks_is_ladder: false,
                     border: None,
                     section_writer: None,
                 }

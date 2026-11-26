@@ -1195,11 +1195,14 @@ impl Game<'_> {
                 let area = area.inflate(Vec3::new(1.0e-7, 1.0e-7, 1.0e-7));
                 grid.near_except(area, Some(a.id), &mut nearby);
             }
-            let (world, registry, facts, collision) = (
+            let (world, registry, facts, collision, climbing) = (
                 &self.world,
                 self.pack.assets.registry,
                 self.res.facts(),
                 self.collision,
+                self.world_tables
+                    .as_ref()
+                    .map_or(&self.res.motion().climbing, |t| &t.climbing),
             );
             let mut scene = horizon_client::collisions::SceneCollisions {
                 world,
@@ -1210,7 +1213,7 @@ impl Game<'_> {
             if let Some(step) = a.tick_move(
                 &mut scene,
                 facts,
-                &self.res.motion().climbing,
+                climbing,
                 in_water,
                 Some(self.border.geometry()),
                 &nearby,

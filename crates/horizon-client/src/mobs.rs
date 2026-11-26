@@ -3310,6 +3310,8 @@ pub struct MobWorld<'a> {
     /// The owning side's attribute definitions for species-specific writes.
     pub attributes: &'a Arc<horizon_world::attributes::entity::Catalog>,
     pub movement: &'a horizon_world::movement_properties::BoundMovementProperties,
+    /// `LivingEntity.onClimbable` tags plus open trapdoors and ladders, O(1) by `BlockStateId`.
+    pub climbing: &'a horizon_world::climbing::ClimbingRegistry<'a>,
     pub collision: &'a BlockCollisionRegistry<'a>,
     pub suffocation: &'a horizon_world::suffocation::SuffocationRegistry<'a>,
     pub data: &'a MobData,
@@ -3403,6 +3405,8 @@ pub struct MobWorld<'a> {
     pub asks_living_destroy_block: bool,
     /// Whether a server listener can cancel baby spawning.
     pub asks_baby_spawn: bool,
+    /// Whether any mod block part subscribes to `IBlockExtension.isLadder`.
+    pub asks_is_ladder: bool,
     /// `Level.getEntity(uuid)`, for the UUIDs a mob kept of entities that were
     /// not in the level (a warden's anger, `AngerManagement.angerByUuid`).
     /// None: this world keeps no entity UUIDs, so nothing is resolved.

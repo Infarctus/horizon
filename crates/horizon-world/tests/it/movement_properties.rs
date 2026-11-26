@@ -99,16 +99,29 @@ fn reloaded_tags_preserve_previous_binding_and_coefficients() {
     tags.fences.insert("minecraft:stone".into());
     tags.suppresses_bounce.insert("minecraft:water".into());
     let changed = properties.bind(&tags).unwrap();
+    let rebound = empty.rebind(&registry, &tags).unwrap();
     assert!(!empty.get(BlockStateId(0)).unwrap().fence);
     assert!(changed.get(BlockStateId(0)).unwrap().fence);
+    assert!(rebound.get(BlockStateId(0)).unwrap().fence);
     let water = changed.get(BlockStateId(1)).unwrap();
+    let rebound_water = rebound.get(BlockStateId(1)).unwrap();
     assert!(water.water && water.suppresses_bounce);
+    assert!(rebound_water.water && rebound_water.suppresses_bounce);
     assert_eq!(
         water.coefficients.speed_factor.to_bits(),
         (-0.0f32).to_bits()
     );
+    assert_eq!(
+        rebound_water.coefficients.speed_factor.to_bits(),
+        (-0.0f32).to_bits()
+    );
+    assert_eq!(
+        rebound_water.coefficients.fence_gate,
+        water.coefficients.fence_gate
+    );
     tags.walls.insert("minecraft:missing".into());
     assert!(properties.bind(&tags).is_err());
+    assert!(empty.rebind(&registry, &tags).is_err());
     assert!(empty.get(BlockStateId(2)).is_err());
 }
 #[test]

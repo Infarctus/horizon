@@ -27,6 +27,7 @@ pub(in crate::game) struct ItemTables<'a> {
     facts: &'a BlockFacts,
     collision: &'a BlockCollisionRegistry<'a>,
     motion: &'a MotionResources,
+    blocks: &'a horizon_world::movement_properties::BoundMovementProperties,
     registry: &'a BlockRegistry,
     border: &'a BorderGeometry,
     context: &'a horizon_world::native_load_context::LoopContext,
@@ -39,6 +40,7 @@ impl<'w> Game<'w> {
             facts: self.res.facts(),
             collision: self.collision,
             motion: self.res.motion(),
+            blocks: self.world_movement(),
             registry: self.pack.assets.registry,
             border: self.border.geometry(),
             context: &self.loop_context,
@@ -75,7 +77,7 @@ impl ItemTables<'_> {
             heights,
             entity_boxes,
             Some(self.border),
-            Some(&self.motion.blocks),
+            Some(self.blocks),
             self.context,
         );
         let landed = item
@@ -110,7 +112,7 @@ impl ItemTables<'_> {
             self.world,
             self.facts,
             no_physics,
-            Some(&self.motion.blocks),
+            Some(self.blocks),
             step,
             self.context,
         );

@@ -686,6 +686,8 @@ struct WorldRest {
 /// resource root's own. Worlds without packs use `Resources.rest` directly.
 struct WorldTables {
     conditions: horizon_world::conditions::LoadConditions,
+    movement: horizon_world::movement_properties::BoundMovementProperties,
+    climbing: horizon_world::climbing::ClimbingRegistry<'static>,
     suffocation: horizon_world::suffocation::SuffocationRegistry<'static>,
     /// The pack files the tables were built from (a native mod's among
     /// them), for the advancement tree reload and the loot data.

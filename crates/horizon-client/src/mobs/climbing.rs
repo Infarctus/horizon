@@ -37,32 +37,45 @@ impl Mob {
             self.position.z.floor() as i32,
         );
         let state = w.world.block(x, y, z);
-        let facts = w.facts.get(state);
-        if self.extra.fall_flying && w.has_tag("minecraft:can_glide_through", &facts.name) {
+        let info = w
+            .climbing
+            .get(state)
+            .unwrap_or(horizon_world::climbing::ClimbingState::EMPTY);
+        // Almost every block (including air) has no climbing, gliding, or open-trapdoor
+        // behavior; when no mod hooks `is_ladder`, short-circuit without touching `BlockFacts`.
+        if info.is_empty() && !w.asks_is_ladder {
+            return false;
+        }
+        if self.extra.fall_flying && info.is_glide_through() {
             return false;
         }
         // `IBlockExtension.isLadder`: the block's parts answer after the tag.
-        let mut ladder = w.has_tag("minecraft:climbable", &facts.name);
-        crate::motion::native_is_ladder(
-            w.loop_context,
-            self.id,
-            BlockPos::new(x, y, z),
-            state,
-            &mut ladder,
-        );
+        let mut ladder = info.is_climbable();
+        if w.asks_is_ladder {
+            crate::motion::native_is_ladder(
+                w.loop_context,
+                self.id,
+                BlockPos::new(x, y, z),
+                state,
+                &mut ladder,
+            );
+        }
         if ladder {
             return true;
         }
-        if !facts.has_class("TrapDoorBlock") || w.prop(x, y, z, "open") != Some("true") {
+        let Some(facing) = info.open_trapdoor_facing() else {
             return false;
-        }
+        };
         // `IBlockExtension.makesOpenTrapdoorAboveClimbable`: the parts of the block below answer
         // after vanilla's ladder test.
-        let mut climbable = w.block_name(x, y - 1, z) == "minecraft:ladder"
-            && w.prop(x, y - 1, z, "facing") == w.prop(x, y, z, "facing");
+        let below_state = w.world.block(x, y - 1, z);
+        let mut climbable = w
+            .climbing
+            .get(below_state)
+            .is_some_and(|below| below.ladder_facing() == Some(facing));
         crate::motion::ladder::native_makes_open_trapdoor_above_climbable(
             w.loop_context,
-            w.world.block(x, y - 1, z),
+            below_state,
             BlockPos::new(x, y - 1, z),
             state,
             &mut climbable,

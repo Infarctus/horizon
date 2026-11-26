@@ -1059,6 +1059,7 @@ fn run_test_world(
         fluid_tables: &motion.fluids,
         attributes: &motion.attributes,
         movement: &motion.blocks,
+        climbing: &motion.climbing,
         collision,
         suffocation,
         data,
@@ -1105,6 +1106,7 @@ fn run_test_world(
         asks_animal_tame: false,
         asks_living_destroy_block: false,
         asks_baby_spawn: false,
+        asks_is_ladder: false,
         border: None,
         section_writer: None,
     };

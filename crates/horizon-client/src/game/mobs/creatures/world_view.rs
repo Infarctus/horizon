@@ -20,7 +20,8 @@ impl Game<'_> {
             facts: self.res.facts(),
             fluid_tables: &self.motion.fluids,
             attributes: &self.motion.attributes,
-            movement: &self.motion.blocks,
+            movement: self.world_movement(),
+            climbing: self.world_climbing(),
             collision: self.collision,
             suffocation: self.mob_suffocation(),
             data: self.res.mob_data(),
@@ -106,6 +107,8 @@ impl Game<'_> {
                 && mod_api::__private::listened(mod_api::HookId::LivingDestroyBlock),
             asks_baby_spawn: self.remote.is_none()
                 && mod_api::__private::listened(mod_api::HookId::BabyEntitySpawn),
+            // Block hook (`IBlockExtension.isLadder`) fires on both client and server sides.
+            asks_is_ladder: mod_api::__private::has_scoped_hook(mod_api::HookId::IsLadder),
             // A warden's away suspects are UUIDs: on the server side, where the
             // entity UUIDs live, they resolve back to the mobs that are here.
             who_lookup: if self.remote.is_none() {

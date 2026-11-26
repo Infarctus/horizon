@@ -233,6 +233,18 @@ impl Game<'_> {
     pub(super) fn items(&self) -> &Items {
         world_items!(self)
     }
+    pub(super) fn world_movement(
+        &self,
+    ) -> &horizon_world::movement_properties::BoundMovementProperties {
+        self.world_tables
+            .as_ref()
+            .map_or(&self.motion.blocks, |t| &t.movement)
+    }
+    pub(super) fn world_climbing(&self) -> &horizon_world::climbing::ClimbingRegistry<'static> {
+        self.world_tables
+            .as_ref()
+            .map_or(&self.motion.climbing, |t| &t.climbing)
+    }
     pub(super) fn mob_suffocation(
         &self,
     ) -> &horizon_world::suffocation::SuffocationRegistry<'static> {
@@ -375,6 +387,32 @@ impl Game<'_> {
             root,
             &overlay,
         );
+        let registry = self.pack.assets.registry;
+        let block_tag_set = |name: &str| -> Result<std::collections::BTreeSet<String>> {
+            let members = items
+                .block_tags
+                .get(name)
+                .ok_or_else(|| format!("missing motion block tag {name}"))?;
+            Ok(members
+                .iter()
+                .filter(|block| registry.default_state(block).is_some())
+                .cloned()
+                .collect())
+        };
+        let movement = self.motion.blocks.rebind(
+            registry,
+            &horizon_world::movement_properties::MovementTags {
+                fences: block_tag_set("minecraft:fences")?,
+                walls: block_tag_set("minecraft:walls")?,
+                suppresses_bounce: block_tag_set("minecraft:suppresses_bounce")?,
+            },
+        )?;
+        let climbing = horizon_world::climbing::ClimbingRegistry::new(
+            registry,
+            &horizon_client::motion::trapdoor_blocks(self.res.facts()),
+            &block_tag_set("minecraft:climbable")?,
+            &block_tag_set("minecraft:can_glide_through")?,
+        )?;
         let causes_suffocation = items
             .block_tags
             .get("minecraft:causes_suffocation")
@@ -461,6 +499,8 @@ impl Game<'_> {
         Ok((
             Some(WorldTables {
                 conditions,
+                movement,
+                climbing,
                 suffocation,
                 files,
                 items: Arc::new(items),

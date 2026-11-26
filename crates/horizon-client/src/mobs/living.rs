@@ -1079,8 +1079,11 @@ impl Mob {
         let supporting = self.supporting;
         let on = self.supported_on_pos(w, supporting, 1.0e-5);
         let state = w.world.block(on[0], on[1], on[2]);
-        let climbable = w.facts.get(state).name.as_ref() == "minecraft:powder_snow"
-            || w.has_tag("minecraft:climbable", &w.facts.get(state).name);
+        let climbable = w
+            .climbing
+            .get(state)
+            .is_some_and(horizon_world::climbing::ClimbingState::is_climbable)
+            || w.movement.get(state).is_ok_and(|b| b.powder_snow);
         let steps = &mut self.ai.steps;
         steps.move_dist += if climbable { full } else { horizontal };
         steps.fly_dist += full;
@@ -1191,8 +1194,8 @@ impl Mob {
     ) {
         let tick = self.age as i32;
         let last = self.ai.steps.last_crystal_sound_play_tick;
-        if !w.has_tag("minecraft:crystal_sound_blocks", &w.facts.get(state).name)
-            || tick < last + 20
+        if tick < last + 20
+            || !w.has_tag("minecraft:crystal_sound_blocks", &w.facts.get(state).name)
         {
             return;
         }
@@ -1282,19 +1285,19 @@ impl Mob {
         if offset <= 1.0e-5 {
             return p;
         }
-        let name = &w.facts.get(w.world.block(p[0], p[1], p[2])).name;
+        let state = w.world.block(p[0], p[1], p[2]);
         // (!(offset <= 0.5) || !FENCES) && !WALLS && !(FenceGateBlock)
-        let below = !w.has_tag("minecraft:walls", name)
-            && !w.has_tag("minecraft:fence_gates", name)
-            && (offset > 0.5 || !w.has_tag("minecraft:fences", name));
-        if below {
+        let keeps_column = w.movement.get(state).is_ok_and(|b| {
+            b.wall || b.coefficients.fence_gate || (f64::from(offset) <= 0.5 && b.fence)
+        });
+        if keeps_column {
+            p
+        } else {
             [
                 p[0],
                 (self.position.y - f64::from(offset)).floor() as i32,
                 p[2],
             ]
-        } else {
-            p
         }
     }
     /// Entity.getOnPos(offset) without a supporting block record.
@@ -2712,6 +2715,7 @@ mod tests {
                 fluid_tables: &motion.fluids,
                 attributes: &motion.attributes,
                 movement: &motion.blocks,
+                climbing: &motion.climbing,
                 collision: &collision,
                 suffocation: &suffocation,
                 data: &data,
@@ -2757,6 +2761,7 @@ mod tests {
                 asks_animal_tame: false,
                 asks_living_destroy_block: false,
                 asks_baby_spawn: false,
+                asks_is_ladder: false,
                 border: None,
                 section_writer: None,
             };
@@ -2846,6 +2851,7 @@ mod tests {
                 fluid_tables: &motion.fluids,
                 attributes: &motion.attributes,
                 movement: &motion.blocks,
+                climbing: &motion.climbing,
                 collision: &collision,
                 suffocation: &suffocation,
                 data: &data,
@@ -2891,6 +2897,7 @@ mod tests {
                 asks_animal_tame: false,
                 asks_living_destroy_block: false,
                 asks_baby_spawn: false,
+                asks_is_ladder: false,
                 border: None,
                 section_writer: None,
             };
@@ -2981,6 +2988,7 @@ mod tests {
             fluid_tables: &motion.fluids,
             attributes: &motion.attributes,
             movement: &motion.blocks,
+            climbing: &motion.climbing,
             collision: &collision,
             suffocation: &suffocation,
             data: &data,
@@ -3026,6 +3034,7 @@ mod tests {
             asks_animal_tame: false,
             asks_living_destroy_block: false,
             asks_baby_spawn: false,
+            asks_is_ladder: false,
             border: None,
             section_writer: None,
         };
@@ -3121,12 +3130,14 @@ mod tests {
                 asks_animal_tame: false,
                 asks_living_destroy_block: false,
                 asks_baby_spawn: false,
+                asks_is_ladder: false,
                 teams: Default::default(),
                 world: &world,
                 registry,
                 facts: &facts,
                 fluid_tables: &motion.fluids,
                 movement: &motion.blocks,
+                climbing: &motion.climbing,
                 collision: &collision,
                 suffocation: &suffocation,
                 data: &data,

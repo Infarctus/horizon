@@ -805,7 +805,7 @@ impl Game<'_> {
         // the factor changes nothing there (measured on a rail over soul sand).
         let factor = crate::motion::block_speed_factor_at(
             &self.world,
-            &self.motion.blocks,
+            self.world_movement(),
             &self.loop_context,
             c.position,
             None,

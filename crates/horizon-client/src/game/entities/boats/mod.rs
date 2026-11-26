@@ -538,7 +538,7 @@ impl Game<'_> {
         // Entity.move's last step: soul sand and honey slow the boat too.
         let factor = crate::motion::block_speed_factor_at(
             &self.world,
-            &self.motion.blocks,
+            self.world_movement(),
             &self.loop_context,
             b.position,
             None,

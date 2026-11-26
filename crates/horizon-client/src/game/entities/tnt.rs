@@ -160,10 +160,14 @@ impl Game<'_> {
             self.non_living_fall_on(id, position, bounds, fall);
             self.post_landing_event(position, bounds, false);
         }
+        let blocks = self
+            .world_tables
+            .as_ref()
+            .map_or(&self.res.motion().blocks, |t| &t.movement);
         let t = &mut self.tnts[i];
         let factor = horizon_client::motion::block_speed_factor_at(
             &self.world,
-            &self.res.motion().blocks,
+            blocks,
             &self.loop_context,
             t.position,
             None,
@@ -197,6 +201,10 @@ impl Game<'_> {
     /// `i` is its place in the list; the caller has checked it is ticking.
     /// `entities` are the boxes that stop its move (`Game::item_entity_collisions`).
     pub(super) fn tick_one_tnt(&mut self, i: usize, entities: &[Aabb]) -> Result<()> {
+        let blocks = self
+            .world_tables
+            .as_ref()
+            .map_or(&self.res.motion().blocks, |t| &t.movement);
         let t = &mut self.tnts[i];
         let (tops, landed) = t.tick_among(
             &self.world,
@@ -206,7 +214,7 @@ impl Game<'_> {
             &self.res.motion().fluids,
             &self.loop_context,
             Some(self.border.geometry()),
-            Some(&self.res.motion().blocks),
+            Some(blocks),
             entities,
         )?;
         let (id, snow) = (t.id, (t.previous, t.position, t.bounds(), t.velocity));

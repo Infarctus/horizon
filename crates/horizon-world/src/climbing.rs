@@ -5,13 +5,77 @@ use crate::{
 };
 use horizon_core::position::BlockPos;
 use std::{collections::BTreeSet, fmt, io};
-#[derive(Clone, Copy)]
-struct State {
-    climbable: bool,
-    glide_through: bool,
-    open_trapdoor: Option<u8>,
-    ladder: Option<u8>,
+/// Packed per-`BlockStateId` climbing facts (1 byte/state so the whole table fits in L1 cache):
+/// - bit 0: `#minecraft:climbable`
+/// - bit 1: `#minecraft:can_glide_through`
+/// - bits 2..=4: open trapdoor facing (`0 = none`, `1..=4 = north/south/west/east`)
+/// - bits 5..=7: ladder facing (`0 = none`, `1..=4 = north/south/west/east`)
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClimbingState(u8);
+
+impl ClimbingState {
+    pub const EMPTY: Self = Self(0);
+
+    const CLIMBABLE: u8 = 1 << 0;
+    const GLIDE_THROUGH: u8 = 1 << 1;
+    const TRAPDOOR_SHIFT: u8 = 2;
+    const LADDER_SHIFT: u8 = 5;
+    const FACING_MASK: u8 = 0x07;
+
+    #[inline]
+    fn new(
+        climbable: bool,
+        glide_through: bool,
+        open_trapdoor: Option<u8>,
+        ladder: Option<u8>,
+    ) -> Self {
+        let mut bits = 0u8;
+        if climbable {
+            bits |= Self::CLIMBABLE;
+        }
+        if glide_through {
+            bits |= Self::GLIDE_THROUGH;
+        }
+        if let Some(facing) = open_trapdoor {
+            debug_assert!(facing < 4);
+            bits |= (facing + 1) << Self::TRAPDOOR_SHIFT;
+        }
+        if let Some(facing) = ladder {
+            debug_assert!(facing < 4);
+            bits |= (facing + 1) << Self::LADDER_SHIFT;
+        }
+        Self(bits)
+    }
+
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    #[inline]
+    pub fn is_climbable(self) -> bool {
+        self.0 & Self::CLIMBABLE != 0
+    }
+
+    #[inline]
+    pub fn is_glide_through(self) -> bool {
+        self.0 & Self::GLIDE_THROUGH != 0
+    }
+
+    #[inline]
+    pub fn open_trapdoor_facing(self) -> Option<u8> {
+        let encoded = (self.0 >> Self::TRAPDOOR_SHIFT) & Self::FACING_MASK;
+        (encoded != 0).then(|| encoded - 1)
+    }
+
+    #[inline]
+    pub fn ladder_facing(self) -> Option<u8> {
+        let encoded = (self.0 >> Self::LADDER_SHIFT) & Self::FACING_MASK;
+        (encoded != 0).then(|| encoded - 1)
+    }
 }
+
 fn horizontal_facing(value: Option<&str>) -> Option<u8> {
     match value {
         Some("north") => Some(0),
@@ -23,12 +87,13 @@ fn horizontal_facing(value: Option<&str>) -> Option<u8> {
 }
 pub struct ClimbingRegistry<'r> {
     registry: &'r BlockRegistry,
-    states: Vec<State>,
+    states: Vec<ClimbingState>,
 }
 impl<'r> ClimbingRegistry<'r> {
-    /// Trapdoor names are imported class identities, not inferred from spelling. A tagged
-    /// state without a valid `facing` and `open` is not a trapdoor and is skipped, not an error.
-    /// Rebuild this immutable snapshot when either resolved block tag reloads.
+    /// `trapdoors` holds `TrapDoorBlock` block names (or tag entries standing in for them); any
+    /// entry without a valid `facing` and `open` property is skipped rather than treated as an
+    /// error. Rebuild this immutable snapshot when `#minecraft:climbable` or
+    /// `#minecraft:can_glide_through` reloads.
     pub fn new(
         registry: &'r BlockRegistry,
         trapdoors: &BTreeSet<String>,
@@ -54,30 +119,35 @@ impl<'r> ClimbingRegistry<'r> {
             } else {
                 None
             };
-            states.push(State {
-                climbable: climbable.contains(&s.name),
-                glide_through: glide_through.contains(&s.name),
+            let ladder = if s.name == "minecraft:ladder" {
+                Some(facing.ok_or_else(|| invalid("invalid climbing facing"))?)
+            } else {
+                None
+            };
+            states.push(ClimbingState::new(
+                climbable.contains(&s.name),
+                glide_through.contains(&s.name),
                 open_trapdoor,
-                ladder: if s.name == "minecraft:ladder" {
-                    Some(facing.ok_or_else(|| invalid("invalid climbing facing"))?)
-                } else {
-                    None
-                },
-            });
+                ladder,
+            ));
         }
         Ok(Self { registry, states })
     }
     pub fn registry(&self) -> &'r BlockRegistry {
         self.registry
     }
-    fn state(&self, id: BlockStateId) -> io::Result<State> {
-        self.states
-            .get(id.0 as usize)
-            .copied()
+    #[inline]
+    pub fn get(&self, id: BlockStateId) -> Option<ClimbingState> {
+        self.states.get(id.0 as usize).copied()
+    }
+    #[inline]
+    fn state(&self, id: BlockStateId) -> io::Result<ClimbingState> {
+        self.get(id)
             .ok_or_else(|| invalid("climbing state outside registry"))
     }
+    #[inline]
     pub fn is_climbable_tag(&self, id: BlockStateId) -> io::Result<bool> {
-        Ok(self.state(id)?.climbable)
+        Ok(self.state(id)?.is_climbable())
     }
 }
 pub trait ClimbingWorld {
@@ -133,15 +203,15 @@ pub fn on_climbable<W: ClimbingWorld>(
     let position = world.block_position().map_err(World)?;
     let in_state = world.in_block_state().map_err(World)?;
     let state = registry.state(in_state).map_err(Data)?;
-    if world.is_fall_flying().map_err(World)? && state.glide_through {
+    if world.is_fall_flying().map_err(World)? && state.is_glide_through() {
         return Ok(false);
     }
-    let climbable = if world.adjust_ladder(position, in_state, state.climbable) {
+    let climbable = if world.adjust_ladder(position, in_state, state.is_climbable()) {
         true
-    } else if let Some(facing) = state.open_trapdoor {
+    } else if let Some(facing) = state.open_trapdoor_facing() {
         let below = BlockPos::new(position.x, position.y.wrapping_sub(1), position.z);
         let below_state = world.block_state(below).map_err(World)?;
-        let ladder = registry.state(below_state).map_err(Data)?.ladder == Some(facing);
+        let ladder = registry.state(below_state).map_err(Data)?.ladder_facing() == Some(facing);
         world.adjust_trapdoor_ladder(below, below_state, in_state, ladder)
     } else {
         false
@@ -413,5 +483,33 @@ mod tests {
         let mut closed = world(CLOSED_TRAPDOOR_NORTH, AIR, Some(true));
         assert!(!on_climbable(&mut closed, &climbing).unwrap());
         assert!(closed.below_asked.is_empty());
+    }
+
+    #[test]
+    fn packed_climbing_state_round_trips_all_flags_and_facings() {
+        assert_eq!(std::mem::size_of::<ClimbingState>(), 1);
+        assert!(ClimbingState::EMPTY.is_empty());
+        assert!(!ClimbingState::EMPTY.is_climbable());
+        assert!(!ClimbingState::EMPTY.is_glide_through());
+        assert_eq!(ClimbingState::EMPTY.open_trapdoor_facing(), None);
+        assert_eq!(ClimbingState::EMPTY.ladder_facing(), None);
+
+        for climbable in [false, true] {
+            for glide in [false, true] {
+                for trapdoor in [None, Some(0), Some(1), Some(2), Some(3)] {
+                    for ladder in [None, Some(0), Some(1), Some(2), Some(3)] {
+                        let s = ClimbingState::new(climbable, glide, trapdoor, ladder);
+                        assert_eq!(s.is_climbable(), climbable);
+                        assert_eq!(s.is_glide_through(), glide);
+                        assert_eq!(s.open_trapdoor_facing(), trapdoor);
+                        assert_eq!(s.ladder_facing(), ladder);
+                        assert_eq!(
+                            s.is_empty(),
+                            !climbable && !glide && trapdoor.is_none() && ladder.is_none()
+                        );
+                    }
+                }
+            }
+        }
     }
 }

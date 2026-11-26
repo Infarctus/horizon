@@ -32,6 +32,7 @@ pub struct MovementBlock {
     pub suppresses_bounce: bool,
     pub water: bool,
     pub bubble_column: bool,
+    pub powder_snow: bool,
 }
 #[derive(Default)]
 pub struct MovementTags {
@@ -129,6 +130,7 @@ impl<'r> MovementProperties<'r> {
                     suppresses_bounce: tags.suppresses_bounce.contains(name),
                     water: name == "minecraft:water",
                     bubble_column: name == "minecraft:bubble_column",
+                    powder_snow: name == "minecraft:powder_snow",
                 }
             })
             .collect();
@@ -139,11 +141,44 @@ pub struct BoundMovementProperties {
     states: Vec<MovementBlock>,
 }
 impl BoundMovementProperties {
+    #[inline]
     pub fn get(&self, state: BlockStateId) -> io::Result<MovementBlock> {
         self.states
             .get(state.0 as usize)
             .copied()
             .ok_or_else(|| invalid("movement state outside registry"))
+    }
+    /// Rebind reloadable movement block tags (`#minecraft:fences`, `#minecraft:walls`,
+    /// `#minecraft:suppresses_bounce`) while keeping the frozen per-state coefficients.
+    pub fn rebind(&self, registry: &BlockRegistry, tags: &MovementTags) -> io::Result<Self> {
+        if self.states.len() != registry.len() {
+            return Err(invalid("movement registry length mismatch"));
+        }
+        for name in tags
+            .fences
+            .iter()
+            .chain(&tags.walls)
+            .chain(&tags.suppresses_bounce)
+        {
+            if registry.default_state(name).is_none() {
+                return Err(invalid("unknown movement tag member"));
+            }
+        }
+        let states = self
+            .states
+            .iter()
+            .enumerate()
+            .map(|(id, block)| {
+                let name = &registry.state(BlockStateId(id as u32)).unwrap().name;
+                MovementBlock {
+                    fence: tags.fences.contains(name),
+                    wall: tags.walls.contains(name),
+                    suppresses_bounce: tags.suppresses_bounce.contains(name),
+                    ..*block
+                }
+            })
+            .collect();
+        Ok(Self { states })
     }
 }
 pub trait MovementBlockProvider {

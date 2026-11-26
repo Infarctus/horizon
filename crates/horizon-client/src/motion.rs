@@ -160,6 +160,17 @@ pub use surface::{
     native_is_ladder,
 };
 
+/// Blocks whose Java class hierarchy includes `TrapDoorBlock` (`LivingEntity.onClimbable`).
+pub fn trapdoor_blocks(facts: &crate::blocks::BlockFacts) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for state in &facts.states {
+        if state.has_class("TrapDoorBlock") && !out.contains(state.name.as_ref()) {
+            out.insert(state.name.as_ref().to_owned());
+        }
+    }
+    out
+}
+
 pub struct MotionResources {
     pub attributes: Arc<Catalog>,
     pub blocks: BoundMovementProperties,
@@ -239,7 +250,7 @@ impl MotionResources {
         };
         let climbing = ClimbingRegistry::new(
             assets.registry,
-            &tag("minecraft:trapdoors")?,
+            &trapdoor_blocks(facts),
             &tag("minecraft:climbable")?,
             &tag("minecraft:can_glide_through")?,
         )?;

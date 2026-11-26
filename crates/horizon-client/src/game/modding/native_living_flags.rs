@@ -341,7 +341,7 @@ impl Game<'_> {
             spectator,
             gliding,
         };
-        Some(climbing::on_climbable(&mut world, &self.motion.climbing).unwrap_or(false))
+        Some(climbing::on_climbable(&mut world, self.world_climbing()).unwrap_or(false))
     }
     /// The climbing decision for a mob currently lent out of the game's list.
     pub(super) fn native_mob_is_climbing(&self, mob: &horizon_client::mobs::Mob) -> bool {
@@ -353,7 +353,7 @@ impl Game<'_> {
             spectator: false,
             gliding: mob.extra.fall_flying,
         };
-        climbing::on_climbable(&mut world, &self.motion.climbing).unwrap_or(false)
+        climbing::on_climbable(&mut world, self.world_climbing()).unwrap_or(false)
     }
 
     /// Whether the entity is a baby (`LivingEntity.isBaby`): a mob answers
