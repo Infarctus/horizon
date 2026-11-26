@@ -76,6 +76,12 @@ env:
   WGPU_BACKEND: "dx12"
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # Matches .cargo/config.toml so -Zthreads=4 also works in temp /tmp workspaces
+  # spawned by Python tests (test_pr_ready.py, test_check_layers.py).
+  RUSTC_BOOTSTRAP: "1"
+  # Cap concurrent rustc jobs to 2 (2 x -Zthreads=4 = 8 frontend threads on 4 vCPUs)
+  # to avoid OOM/SIGTERM (exit 143) when linking horizon-client test binaries on 16 GiB runners.
+  CARGO_BUILD_JOBS: "2"
   # Keep Cargo.toml's [profile.dev] debug = "line-tables-only":
   # crash::tests::the_debug_crash_is_reported_as_vanillas requires line tables,
   # and uniform debuginfo maximizes cache hit sharing across jobs.
@@ -443,6 +449,15 @@ jobs:
             sudo rm -rf /usr/local/.ghcup &
             wait
           fi
+          swap_mb=$(free -m | awk '/^Swap:/{print $2}')
+          if [ "${swap_mb:-0}" -lt 4096 ]; then
+            echo "Enabling 8G swapfile (current swap: ${swap_mb:-0}M) to guard against link-time OOM..."
+            sudo fallocate -l 8G /swapfile_ci
+            sudo chmod 600 /swapfile_ci
+            sudo mkswap /swapfile_ci >/dev/null
+            sudo swapon /swapfile_ci
+          fi
+          free -h
           df -h /
 
       - name: Checkout target ref
@@ -544,7 +559,10 @@ jobs:
           raw_out="$RUNNER_TEMP/pr-ready-raw.md"
           summary_out="$RUNNER_TEMP/pr-ready-summary.md"
           status=0
-          env -u GITHUB_REPOSITORY python3 tools/pr_ready.py --base "$BASE_REF" >"$raw_out" || status=$?
+          timeout --signal=INT --kill-after=60 4800 env -u GITHUB_REPOSITORY python3 tools/pr_ready.py --base "$BASE_REF" >"$raw_out" || status=$?
+          if [ "$status" -eq 124 ]; then
+            echo "::warning::tools/pr_ready.py hit the 80m soft timeout; saving partial cache and summary."
+          fi
 
           python3 - "$raw_out" "$summary_out" <<'PY'
           import re
@@ -572,6 +590,10 @@ jobs:
           echo "=== Ready-to-paste PR Self-check block ==="
           cat "$summary_out"
           exit "$status"
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats || true
 
       - name: Upload pr_ready summary artifact
         if: always()
@@ -603,6 +625,15 @@ jobs:
             sudo rm -rf /usr/local/.ghcup &
             wait
           fi
+          swap_mb=$(free -m | awk '/^Swap:/{print $2}')
+          if [ "${swap_mb:-0}" -lt 4096 ]; then
+            echo "Enabling 8G swapfile (current swap: ${swap_mb:-0}M) to guard against link-time OOM..."
+            sudo fallocate -l 8G /swapfile_ci
+            sudo chmod 600 /swapfile_ci
+            sudo mkswap /swapfile_ci >/dev/null
+            sudo swapon /swapfile_ci
+          fi
+          free -h
           df -h /
 
       - name: Checkout target ref
@@ -674,6 +705,15 @@ jobs:
             sudo rm -rf /usr/local/.ghcup &
             wait
           fi
+          swap_mb=$(free -m | awk '/^Swap:/{print $2}')
+          if [ "${swap_mb:-0}" -lt 4096 ]; then
+            echo "Enabling 8G swapfile (current swap: ${swap_mb:-0}M) to guard against link-time OOM..."
+            sudo fallocate -l 8G /swapfile_ci
+            sudo chmod 600 /swapfile_ci
+            sudo mkswap /swapfile_ci >/dev/null
+            sudo swapon /swapfile_ci
+          fi
+          free -h
           df -h /
 
       - name: Checkout target ref
@@ -798,6 +838,15 @@ jobs:
             sudo rm -rf /usr/local/.ghcup &
             wait
           fi
+          swap_mb=$(free -m | awk '/^Swap:/{print $2}')
+          if [ "${swap_mb:-0}" -lt 4096 ]; then
+            echo "Enabling 8G swapfile (current swap: ${swap_mb:-0}M) to guard against link-time OOM..."
+            sudo fallocate -l 8G /swapfile_ci
+            sudo chmod 600 /swapfile_ci
+            sudo mkswap /swapfile_ci >/dev/null
+            sudo swapon /swapfile_ci
+          fi
+          free -h
           df -h /
 
       - name: Checkout target ref
@@ -875,6 +924,15 @@ jobs:
             sudo rm -rf /usr/local/.ghcup &
             wait
           fi
+          swap_mb=$(free -m | awk '/^Swap:/{print $2}')
+          if [ "${swap_mb:-0}" -lt 4096 ]; then
+            echo "Enabling 8G swapfile (current swap: ${swap_mb:-0}M) to guard against link-time OOM..."
+            sudo fallocate -l 8G /swapfile_ci
+            sudo chmod 600 /swapfile_ci
+            sudo mkswap /swapfile_ci >/dev/null
+            sudo swapon /swapfile_ci
+          fi
+          free -h
           df -h /
 
       - name: Checkout target ref
@@ -965,6 +1023,15 @@ jobs:
             sudo rm -rf /usr/local/.ghcup &
             wait
           fi
+          swap_mb=$(free -m | awk '/^Swap:/{print $2}')
+          if [ "${swap_mb:-0}" -lt 4096 ]; then
+            echo "Enabling 8G swapfile (current swap: ${swap_mb:-0}M) to guard against link-time OOM..."
+            sudo fallocate -l 8G /swapfile_ci
+            sudo chmod 600 /swapfile_ci
+            sudo mkswap /swapfile_ci >/dev/null
+            sudo swapon /swapfile_ci
+          fi
+          free -h
           df -h /
 
       - name: Checkout target ref
