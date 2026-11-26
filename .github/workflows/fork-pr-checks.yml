@@ -346,7 +346,7 @@ jobs:
 
           merge_base = sys.argv[1]
           out = subprocess.check_output(
-              ["git", "diff", "--name-only", "--diff-filter=ACMR", f"{merge_base}...HEAD", "--", "*.rs", ":!launcher/**"],
+              ["git", "diff", "--name-only", "--diff-filter=ACMR", f"{merge_base}...HEAD", "--", "*.rs", ":!launcher/"],
               text=True,
           )
           files = [p for p in out.splitlines() if p and Path(p).is_file()]
@@ -399,7 +399,7 @@ jobs:
           MERGE_BASE: ${{ needs.scope.outputs.merge_base }}
         run: |
           set -euo pipefail
-          mapfile -t changed_launcher_rs < <(git diff --name-only --diff-filter=ACMR "$MERGE_BASE"...HEAD -- 'launcher/**/*.rs')
+          mapfile -t changed_launcher_rs < <(git diff --name-only --diff-filter=ACMR "$MERGE_BASE"...HEAD -- ':(glob)launcher/**/*.rs')
           if [ "${#changed_launcher_rs[@]}" -gt 0 ]; then
             echo "Checking launcher rustfmt..."
             cargo fmt --manifest-path launcher/Cargo.toml -- --check
@@ -724,13 +724,15 @@ jobs:
       - name: Run workspace and server clippy
         run: |
           set -euo pipefail
+          rc=0
           if [ -f tools/ci/check_warnings.py ]; then
-            python3 tools/ci/check_warnings.py cargo clippy --locked --keep-going --workspace --all-targets
-            python3 tools/ci/check_warnings.py cargo clippy --locked --keep-going -p horizon-client -p horizon-game -p horizon-mod-host --no-default-features --all-targets
+            python3 tools/ci/check_warnings.py cargo clippy --locked --keep-going --workspace --all-targets || rc=1
+            python3 tools/ci/check_warnings.py cargo clippy --locked --keep-going -p horizon-client -p horizon-game -p horizon-mod-host --no-default-features --all-targets || rc=1
           else
-            cargo clippy --locked --workspace --all-targets -- -D warnings
-            cargo clippy --locked -p horizon-client -p horizon-game -p horizon-mod-host --no-default-features --all-targets -- -D warnings
+            cargo clippy --locked --workspace --all-targets -- -D warnings || rc=1
+            cargo clippy --locked -p horizon-client -p horizon-game -p horizon-mod-host --no-default-features --all-targets -- -D warnings || rc=1
           fi
+          exit "$rc"
 
   tests:
     name: "Rust tests (${{ inputs.mode }})"
@@ -819,7 +821,9 @@ jobs:
         run: |
           set -euo pipefail
           crate_args=()
-          has_mod_package=false
+          selected_crates=()
+          need_holder_actor=false
+          need_mod_package_index=false
           selection="${INPUT_CRATES:-$TOUCHED_CRATES}"
           if [ "$selection" = "__NONE__" ]; then
             if [ -n "$INPUT_TEST_FILTER" ]; then
@@ -831,17 +835,19 @@ jobs:
           fi
           if [ "$selection" = "__WORKSPACE__" ] || [ -z "$selection" ]; then
             crate_args=(--workspace)
-            has_mod_package=true
+            need_holder_actor=true
           else
             for c in $selection; do
               if [ "$c" = "horizon-mod-package" ]; then
-                has_mod_package=true
+                need_holder_actor=true
+                need_mod_package_index=true
               fi
+              selected_crates+=("$c")
               crate_args+=(-p "$c")
             done
           fi
 
-          if [ "$has_mod_package" = "true" ]; then
+          if [ "$need_holder_actor" = "true" ]; then
             cargo build --locked -p horizon-mod-package --features runtime-process --example holder_actor
           fi
 
@@ -851,7 +857,7 @@ jobs:
           fi
 
           test_cmd=(cargo test --locked "${crate_args[@]}" --lib --bins --tests)
-          if [ "$has_mod_package" = "true" ]; then
+          if [ "$need_mod_package_index" = "true" ]; then
             test_cmd+=(--features horizon-mod-package/index)
           fi
           if [ -n "$INPUT_TEST_FILTER" ]; then
@@ -865,9 +871,35 @@ jobs:
           "${test_cmd[@]}"
 
           if [ "$INPUT_MODE" = "verify" ] && [ -z "$INPUT_TEST_FILTER" ]; then
-            doc_cmd=(cargo test --locked "${crate_args[@]}" --doc)
-            echo "Running ${doc_cmd[*]}"
-            "${doc_cmd[@]}"
+            if [ "${crate_args[0]}" = "--workspace" ]; then
+              doc_cmd=(cargo test --locked --workspace --doc)
+              echo "Running ${doc_cmd[*]}"
+              "${doc_cmd[@]}"
+            else
+              mapfile -t doc_crates < <(python3 - "${selected_crates[@]}" <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          wanted = set(sys.argv[1:])
+          meta = json.loads(subprocess.check_output(["cargo", "metadata", "--no-deps", "--format-version", "1"], text=True))
+          for pkg in meta["packages"]:
+              if pkg["name"] in wanted and any("lib" in t["kind"] for t in pkg["targets"]):
+                  print(pkg["name"])
+          PY
+              )
+              if [ "${#doc_crates[@]}" -gt 0 ]; then
+                doc_cmd=(cargo test --locked)
+                for c in "${doc_crates[@]}"; do
+                  doc_cmd+=(-p "$c")
+                done
+                doc_cmd+=(--doc)
+                echo "Running ${doc_cmd[*]}"
+                "${doc_cmd[@]}"
+              else
+                echo "No library targets in selected crates; skipping --doc tests."
+              fi
+            fi
           fi
 
   launcher:
