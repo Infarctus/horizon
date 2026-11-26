@@ -81,11 +81,9 @@ env:
   WGPU_BACKEND: "dx12"
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  # Cap concurrent rustc jobs to 3 to keep peak memory comfortable on 16 GiB runners.
-  CARGO_BUILD_JOBS: "3"
   # Keep Cargo.toml's [profile.dev] debug = "line-tables-only":
   # crash::tests::the_debug_crash_is_reported_as_vanillas requires line tables,
-  # and uniform debuginfo maximizes cache hit sharing across jobs.
+  # and uniform debuginfo + RUSTFLAGS maximize Swatinem/rust-cache sharing across jobs.
 
 jobs:
   scope:
@@ -113,11 +111,15 @@ jobs:
           INPUT_TEST_FILTER: ${{ inputs.test_filter }}
         run: |
           set -euo pipefail
+          if [ -z "$INPUT_REF" ] || [[ "$INPUT_REF" = -* ]] || [[ "$INPUT_REF" =~ [[:space:]\`] ]] || [[ "$INPUT_REF" == *".."* ]]; then
+            echo "::error::Invalid ref: $INPUT_REF"
+            exit 1
+          fi
           if [ "$INPUT_REF" = "fork-ci" ]; then
             echo "::error::Cannot run checks against the fork-ci branch itself. Pass a feature branch or commit SHA."
             exit 1
           fi
-          if [[ ! "$INPUT_BASE" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+          if [[ ! "$INPUT_BASE" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$INPUT_BASE" = -* ]] || [[ "$INPUT_BASE" == *".."* ]]; then
             echo "::error::Invalid base branch name: $INPUT_BASE"
             exit 1
           fi
@@ -170,22 +172,29 @@ jobs:
           HEAD_SHA="$(git rev-parse HEAD)"
           MERGE_BASE="$(git merge-base HEAD "$BASE_REF")"
 
+          # Fail closed to true if rust_changes.py is missing or errors (matching upstream ci.yml).
           rust_needed=true
-          server_needed=false
-          launcher_needed=false
-          mod_api_needed=false
+          server_needed=true
+          launcher_needed=true
+          mod_api_needed=true
           if [ -f tools/ci/rust_changes.py ]; then
-            rust_out="$(python3 tools/ci/rust_changes.py "$MERGE_BASE" "$HEAD_SHA" || true)"
-            launcher_out="$(python3 tools/ci/rust_changes.py --launcher "$MERGE_BASE" "$HEAD_SHA" || true)"
-            rust_needed="$(printf '%s\n' "$rust_out" | awk -F= '$1=="required"{print $2}' | tail -n1)"
-            server_needed="$(printf '%s\n' "$rust_out" | awk -F= '$1=="server_build"{print $2}' | tail -n1)"
-            mod_api_needed="$(printf '%s\n' "$rust_out" | awk -F= '$1=="mod_api"{print $2}' | tail -n1)"
-            launcher_needed="$(printf '%s\n' "$launcher_out" | awk -F= '$1=="required"{print $2}' | tail -n1)"
+            if rust_out="$(python3 tools/ci/rust_changes.py "$MERGE_BASE" "$HEAD_SHA")"; then
+              rust_needed="$(printf '%s\n' "$rust_out" | awk -F= '$1=="required"{print $2}' | tail -n1)"
+              server_needed="$(printf '%s\n' "$rust_out" | awk -F= '$1=="server_build"{print $2}' | tail -n1)"
+              mod_api_needed="$(printf '%s\n' "$rust_out" | awk -F= '$1=="mod_api"{print $2}' | tail -n1)"
+            else
+              echo "::warning::tools/ci/rust_changes.py failed; defaulting root Rust checks to true."
+            fi
+            if launcher_out="$(python3 tools/ci/rust_changes.py --launcher "$MERGE_BASE" "$HEAD_SHA")"; then
+              launcher_needed="$(printf '%s\n' "$launcher_out" | awk -F= '$1=="required"{print $2}' | tail -n1)"
+            else
+              echo "::warning::tools/ci/rust_changes.py --launcher failed; defaulting launcher check to true."
+            fi
           fi
           rust_needed="${rust_needed:-true}"
-          server_needed="${server_needed:-false}"
-          launcher_needed="${launcher_needed:-false}"
-          mod_api_needed="${mod_api_needed:-false}"
+          server_needed="${server_needed:-true}"
+          launcher_needed="${launcher_needed:-true}"
+          mod_api_needed="${mod_api_needed:-true}"
 
           touched="$(python3 - "$BASE_REF" <<'PY'
           import sys
@@ -198,10 +207,9 @@ jobs:
               sys.exit(0)
           crates_of, _, _ = pr_ready.packages()
           crates = pr_ready.touched_crates(changed, crates_of)
-          if crates is None:
+          # Match pr_ready.py: workspace Rust changed with empty crate list -> full workspace.
+          if crates is None or not crates:
               print("__WORKSPACE__")
-          elif not crates:
-              print("__NONE__")
           else:
               print(" ".join(crates))
           PY
@@ -225,7 +233,7 @@ jobs:
             echo ""
             if [ "$base_fallback" = "true" ]; then
               echo "> [!WARNING]"
-              echo "> **Upstream fetch failed (`horizon-rust/horizon:${INPUT_BASE}`).** Automatically fell back to fork \`origin/${INPUT_BASE}\` (\`${BASE_SHA:0:12}\`). Verify \`fork/${INPUT_BASE}\` matches upstream before trusting scope or baselines."
+              echo "> **Upstream fetch failed (\`horizon-rust/horizon:${INPUT_BASE}\`).** Automatically fell back to fork \`origin/${INPUT_BASE}\` (\`${BASE_SHA:0:12}\`). Verify \`fork/${INPUT_BASE}\` matches upstream before trusting scope or baselines."
               echo ""
             fi
             echo "- **Ref:** \`${INPUT_REF}\` (\`${HEAD_SHA:0:12}\`)"
@@ -265,20 +273,19 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Fetch base ref
-        env:
-          INPUT_BASE: ${{ inputs.base }}
-          BASE_FALLBACK: ${{ needs.scope.outputs.base_fallback }}
+      - name: Install current stable Rust toolchain (rustfmt + cargo metadata)
         run: |
           set -euo pipefail
-          if [ "$BASE_FALLBACK" = "true" ]; then
-            echo "::warning::Using fork origin/${INPUT_BASE} as base ref (allow_fork_base_fallback=true)."
-            git fetch --no-tags --filter=blob:none origin "refs/heads/${INPUT_BASE}:refs/remotes/upstream/${INPUT_BASE}"
-          else
-            git remote remove upstream 2>/dev/null || true
-            git remote add upstream https://github.com/horizon-rust/horizon.git
-            git fetch --no-tags --filter=blob:none upstream "refs/heads/${INPUT_BASE}:refs/remotes/upstream/${INPUT_BASE}"
-          fi
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+
+      - name: Pin deterministic base ref from scope
+        env:
+          INPUT_BASE: ${{ inputs.base }}
+          MERGE_BASE: ${{ needs.scope.outputs.merge_base }}
+        run: |
+          set -euo pipefail
+          git update-ref "refs/remotes/upstream/${INPUT_BASE}" "$MERGE_BASE"
 
       - name: Set up scratch directories
         run: |
@@ -294,7 +301,12 @@ jobs:
       - name: Public tree check
         id: public_tree
         continue-on-error: true
-        run: python3 tools/check_public_tree.py
+        env:
+          MERGE_BASE: ${{ needs.scope.outputs.merge_base }}
+        run: |
+          set -euo pipefail
+          python3 tools/check_public_tree.py
+          python3 tools/check_public_tree.py --range "${MERGE_BASE}..HEAD"
 
       - name: Repository hygiene check
         id: repo_hygiene
@@ -319,24 +331,68 @@ jobs:
           BASE_REF: ${{ needs.scope.outputs.base_ref }}
         run: python3 tools/check_addresses.py --base "$BASE_REF"
 
-      - name: Rustfmt check (root workspace)
+      - name: Rustfmt check (root workspace changed files)
         id: rustfmt_root
         continue-on-error: true
         env:
           MERGE_BASE: ${{ needs.scope.outputs.merge_base }}
         run: |
           set -euo pipefail
-          mapfile -t changed_root_rs < <(git diff --name-only --diff-filter=ACMR "$MERGE_BASE"...HEAD -- '*.rs' ':!launcher/**')
-          existing_root_rs=()
-          for f in "${changed_root_rs[@]}"; do
-            [ -f "$f" ] && existing_root_rs+=("$f")
-          done
-          if [ "${#existing_root_rs[@]}" -gt 0 ]; then
-            echo "Checking rustfmt (edition 2024) on ${#existing_root_rs[@]} changed Rust file(s)..."
-            rustfmt --edition 2024 --check --config skip_children=true "${existing_root_rs[@]}"
-          fi
+          python3 - "$MERGE_BASE" <<'PY'
+          import subprocess
+          import sys
+          import tomllib
+          from pathlib import Path
 
-      - name: Rustfmt check (launcher)
+          merge_base = sys.argv[1]
+          out = subprocess.check_output(
+              ["git", "diff", "--name-only", "--diff-filter=ACMR", f"{merge_base}...HEAD", "--", "*.rs", ":!launcher/**"],
+              text=True,
+          )
+          files = [p for p in out.splitlines() if p and Path(p).is_file()]
+          if not files:
+              sys.exit(0)
+
+          root = Path(".").resolve()
+          ws_edition = "2024"
+          root_toml = root / "Cargo.toml"
+          if root_toml.is_file():
+              data = tomllib.loads(root_toml.read_text(encoding="utf-8"))
+              ws_edition = str(data.get("workspace", {}).get("package", {}).get("edition", ws_edition))
+
+          def edition_for(path: str) -> str:
+              cur = (root / path).resolve().parent
+              while True:
+                  manifest = cur / "Cargo.toml"
+                  if manifest.is_file():
+                      data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+                      ed = data.get("package", {}).get("edition")
+                      if isinstance(ed, str):
+                          return ed
+                      if isinstance(ed, dict) and ed.get("workspace"):
+                          return ws_edition
+                      if cur == root:
+                          return ws_edition
+                  if cur == root or cur.parent == cur:
+                      return ws_edition
+                  cur = cur.parent
+
+          by_edition: dict[str, list[str]] = {}
+          for f in files:
+              by_edition.setdefault(edition_for(f), []).append(f)
+
+          failed = 0
+          for ed, group in sorted(by_edition.items()):
+              print(f"Checking rustfmt (edition {ed}) on {len(group)} changed Rust file(s)...")
+              rc = subprocess.run(
+                  ["rustfmt", "--edition", ed, "--check", "--config", "skip_children=true", *group]
+              ).returncode
+              if rc != 0:
+                  failed = 1
+          sys.exit(failed)
+          PY
+
+      - name: Rustfmt check (launcher changed files)
         id: rustfmt_launcher
         continue-on-error: true
         env:
@@ -409,7 +465,17 @@ jobs:
             echo ""
             echo "| Check | Outcome |"
             echo "| --- | --- |"
-            for pair in               "Public tree:${OUT_PUBLIC_TREE}"               "Repository hygiene:${OUT_REPO_HYGIENE}"               "Layers:${OUT_LAYERS}"               "Addresses:${OUT_ADDRESSES}"               "Rustfmt (root changed files):${OUT_RUSTFMT_ROOT}"               "Rustfmt (launcher changed files):${OUT_RUSTFMT_LAUNCHER}"               "Nested locks:${OUT_NESTED_LOCKS}"               "Hotspot lists:${OUT_HOTSPOT_LISTS}"               "Hotspot stand-ins:${OUT_HOTSPOT_STAND_INS}"               "Python unit tests:${OUT_PYTHON_TESTS}"
+            for pair in \
+              "Public tree:${OUT_PUBLIC_TREE}" \
+              "Repository hygiene:${OUT_REPO_HYGIENE}" \
+              "Layers:${OUT_LAYERS}" \
+              "Addresses:${OUT_ADDRESSES}" \
+              "Rustfmt (root changed files):${OUT_RUSTFMT_ROOT}" \
+              "Rustfmt (launcher changed files):${OUT_RUSTFMT_LAUNCHER}" \
+              "Nested locks:${OUT_NESTED_LOCKS}" \
+              "Hotspot lists:${OUT_HOTSPOT_LISTS}" \
+              "Hotspot stand-ins:${OUT_HOTSPOT_STAND_INS}" \
+              "Python unit tests:${OUT_PYTHON_TESTS}"
             do
               name="${pair%%:*}"
               outcome="${pair#*:}"
@@ -437,7 +503,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - name: Ensure sufficient disk space on ubuntu-latest
+      - name: Ensure sufficient disk space and swap on ubuntu-latest
         run: |
           set -euo pipefail
           avail_gb=$(df -BG --output=avail / | tail -n 1 | tr -dc '0-9')
@@ -453,14 +519,20 @@ jobs:
           fi
           swap_mb=$(free -m | awk '/^Swap:/{print $2}')
           if [ "${swap_mb:-0}" -lt 4096 ]; then
-            echo "Enabling 8G swapfile (current swap: ${swap_mb:-0}M) to guard against link-time OOM..."
-            sudo fallocate -l 8G /swapfile_ci
-            sudo chmod 600 /swapfile_ci
-            sudo mkswap /swapfile_ci >/dev/null
-            sudo swapon /swapfile_ci
+            mnt_gb=$(df -BG --output=avail /mnt 2>/dev/null | tail -n 1 | tr -dc '0-9' || echo 0)
+            if [ -d /mnt ] && [ "${mnt_gb:-0}" -ge 12 ]; then
+              swap_path=/mnt/swapfile_ci
+            else
+              swap_path=/swapfile_ci
+            fi
+            echo "Enabling 8G swapfile at ${swap_path} (current swap: ${swap_mb:-0}M)..."
+            sudo fallocate -l 8G "$swap_path"
+            sudo chmod 600 "$swap_path"
+            sudo mkswap "$swap_path" >/dev/null
+            sudo swapon "$swap_path"
           fi
           free -h
-          df -h /
+          df -h / /mnt 2>/dev/null || df -h /
 
       - name: Checkout target ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -470,20 +542,13 @@ jobs:
           filter: blob:none
           persist-credentials: false
 
-      - name: Fetch base ref
+      - name: Pin deterministic base ref from scope
         env:
           INPUT_BASE: ${{ inputs.base }}
-          BASE_FALLBACK: ${{ needs.scope.outputs.base_fallback }}
+          MERGE_BASE: ${{ needs.scope.outputs.merge_base }}
         run: |
           set -euo pipefail
-          if [ "$BASE_FALLBACK" = "true" ]; then
-            echo "::warning::Using fork origin/${INPUT_BASE} as base ref (allow_fork_base_fallback=true)."
-            git fetch --no-tags --filter=blob:none origin "refs/heads/${INPUT_BASE}:refs/remotes/upstream/${INPUT_BASE}"
-          else
-            git remote remove upstream 2>/dev/null || true
-            git remote add upstream https://github.com/horizon-rust/horizon.git
-            git fetch --no-tags --filter=blob:none upstream "refs/heads/${INPUT_BASE}:refs/remotes/upstream/${INPUT_BASE}"
-          fi
+          git update-ref "refs/remotes/upstream/${INPUT_BASE}" "$MERGE_BASE"
 
       - name: Set up Python 3.12
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -518,26 +583,10 @@ jobs:
           fi
           echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
 
-      - name: Set up sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
-      - name: Configure sccache wrapper
-        run: |
-          set -euo pipefail
-          {
-            echo "SCCACHE_GHA_ENABLED=true"
-            if [ -f "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh" ]; then
-              chmod +x "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
-              echo "RUSTC_WRAPPER=$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
-            else
-              echo "RUSTC_WRAPPER=sccache"
-            fi
-          } >> "$GITHUB_ENV"
-
       - name: Cache Cargo registry and build dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: fork-pr-checks-tests-v1
+          shared-key: fork-pr-checks-root-v2
           cache-on-failure: true
           save-if: ${{ needs.scope.outputs.rust == 'true' }}
 
@@ -546,7 +595,8 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: launcher
-          shared-key: fork-pr-checks-launcher-v1
+          shared-key: fork-pr-checks-launcher-v2
+          cache-bin: false
           cache-on-failure: true
           save-if: ${{ needs.scope.outputs.launcher == 'true' }}
 
@@ -563,15 +613,18 @@ jobs:
           status=0
           timeout --signal=INT --kill-after=60 4800 env -u GITHUB_REPOSITORY python3 tools/pr_ready.py --base "$BASE_REF" >"$raw_out" || status=$?
           if [ "$status" -eq 124 ]; then
-            echo "::warning::tools/pr_ready.py hit the 80m soft timeout; saving partial cache and summary."
+            echo "::warning::tools/pr_ready.py hit the 80m soft timeout; saving partial Cargo cache and timeout note."
           fi
 
-          python3 - "$raw_out" "$summary_out" <<'PY'
+          python3 - "$raw_out" "$summary_out" "$status" <<'PY'
           import re
           import sys
           from pathlib import Path
 
-          text = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+          text = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace") if Path(sys.argv[1]).is_file() else ""
+          status = int(sys.argv[3])
+          if not text.strip() and status == 124:
+              text = "**pr_ready** timed out at the 80 min soft limit before printing its summary block; Cargo build cache was preserved for the next run.\n"
           text = re.sub(r"host `[^`]+`", "host `ci`", text)
           Path(sys.argv[2]).write_text(text, encoding="utf-8")
           PY
@@ -593,10 +646,6 @@ jobs:
           cat "$summary_out"
           exit "$status"
 
-      - name: Show sccache stats
-        if: always()
-        run: sccache --show-stats || true
-
       - name: Upload pr_ready summary artifact
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -613,7 +662,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - name: Ensure sufficient disk space on ubuntu-latest
+      - name: Ensure sufficient disk space and swap on ubuntu-latest
         run: |
           set -euo pipefail
           avail_gb=$(df -BG --output=avail / | tail -n 1 | tr -dc '0-9')
@@ -629,14 +678,20 @@ jobs:
           fi
           swap_mb=$(free -m | awk '/^Swap:/{print $2}')
           if [ "${swap_mb:-0}" -lt 4096 ]; then
-            echo "Enabling 8G swapfile (current swap: ${swap_mb:-0}M) to guard against link-time OOM..."
-            sudo fallocate -l 8G /swapfile_ci
-            sudo chmod 600 /swapfile_ci
-            sudo mkswap /swapfile_ci >/dev/null
-            sudo swapon /swapfile_ci
+            mnt_gb=$(df -BG --output=avail /mnt 2>/dev/null | tail -n 1 | tr -dc '0-9' || echo 0)
+            if [ -d /mnt ] && [ "${mnt_gb:-0}" -ge 12 ]; then
+              swap_path=/mnt/swapfile_ci
+            else
+              swap_path=/swapfile_ci
+            fi
+            echo "Enabling 8G swapfile at ${swap_path} (current swap: ${swap_mb:-0}M)..."
+            sudo fallocate -l 8G "$swap_path"
+            sudo chmod 600 "$swap_path"
+            sudo mkswap "$swap_path" >/dev/null
+            sudo swapon "$swap_path"
           fi
           free -h
-          df -h /
+          df -h / /mnt 2>/dev/null || df -h /
 
       - name: Checkout target ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -659,28 +714,22 @@ jobs:
           fi
           echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
 
-      - name: Cache clippy Cargo dependencies
+      - name: Cache shared root Cargo dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: fork-pr-checks-clippy-v1
+          shared-key: fork-pr-checks-root-v2
           cache-on-failure: true
           save-if: true
 
       - name: Run workspace and server clippy
-        env:
-          SERVER_BUILD: ${{ needs.scope.outputs.server_build }}
         run: |
           set -euo pipefail
           if [ -f tools/ci/check_warnings.py ]; then
             python3 tools/ci/check_warnings.py cargo clippy --locked --keep-going --workspace --all-targets
-            if [ "$SERVER_BUILD" = "true" ]; then
-              python3 tools/ci/check_warnings.py cargo clippy --locked -p horizon-client --no-default-features --all-targets
-            fi
+            python3 tools/ci/check_warnings.py cargo clippy --locked --keep-going -p horizon-client -p horizon-game -p horizon-mod-host --no-default-features --all-targets
           else
             cargo clippy --locked --workspace --all-targets -- -D warnings
-            if [ "$SERVER_BUILD" = "true" ]; then
-              cargo clippy --locked -p horizon-client --no-default-features --all-targets -- -D warnings
-            fi
+            cargo clippy --locked -p horizon-client -p horizon-game -p horizon-mod-host --no-default-features --all-targets -- -D warnings
           fi
 
   tests:
@@ -688,12 +737,12 @@ jobs:
     needs: scope
     if: >-
       (inputs.mode == 'verify' && needs.scope.outputs.rust == 'true') ||
-      (inputs.mode == 'quick' && (inputs.crates != '' || needs.scope.outputs.rust == 'true')) ||
+      (inputs.mode == 'quick' && (inputs.crates != '' || inputs.test_filter != '' || needs.scope.outputs.rust == 'true')) ||
       (inputs.mode == 'full' && (inputs.crates != '' || inputs.test_filter != ''))
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - name: Ensure sufficient disk space on ubuntu-latest
+      - name: Ensure sufficient disk space and swap on ubuntu-latest
         run: |
           set -euo pipefail
           avail_gb=$(df -BG --output=avail / | tail -n 1 | tr -dc '0-9')
@@ -709,14 +758,20 @@ jobs:
           fi
           swap_mb=$(free -m | awk '/^Swap:/{print $2}')
           if [ "${swap_mb:-0}" -lt 4096 ]; then
-            echo "Enabling 8G swapfile (current swap: ${swap_mb:-0}M) to guard against link-time OOM..."
-            sudo fallocate -l 8G /swapfile_ci
-            sudo chmod 600 /swapfile_ci
-            sudo mkswap /swapfile_ci >/dev/null
-            sudo swapon /swapfile_ci
+            mnt_gb=$(df -BG --output=avail /mnt 2>/dev/null | tail -n 1 | tr -dc '0-9' || echo 0)
+            if [ -d /mnt ] && [ "${mnt_gb:-0}" -ge 12 ]; then
+              swap_path=/mnt/swapfile_ci
+            else
+              swap_path=/swapfile_ci
+            fi
+            echo "Enabling 8G swapfile at ${swap_path} (current swap: ${swap_mb:-0}M)..."
+            sudo fallocate -l 8G "$swap_path"
+            sudo chmod 600 "$swap_path"
+            sudo mkswap "$swap_path" >/dev/null
+            sudo swapon "$swap_path"
           fi
           free -h
-          df -h /
+          df -h / /mnt 2>/dev/null || df -h /
 
       - name: Checkout target ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -747,26 +802,10 @@ jobs:
           fi
           echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
 
-      - name: Set up sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
-      - name: Configure sccache wrapper
-        run: |
-          set -euo pipefail
-          {
-            echo "SCCACHE_GHA_ENABLED=true"
-            if [ -f "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh" ]; then
-              chmod +x "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
-              echo "RUSTC_WRAPPER=$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
-            else
-              echo "RUSTC_WRAPPER=sccache"
-            fi
-          } >> "$GITHUB_ENV"
-
-      - name: Cache test Cargo dependencies
+      - name: Cache shared root Cargo dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: fork-pr-checks-tests-v1
+          shared-key: fork-pr-checks-root-v2
           cache-on-failure: true
           save-if: ${{ inputs.mode == 'verify' }}
 
@@ -783,9 +822,14 @@ jobs:
           has_mod_package=false
           selection="${INPUT_CRATES:-$TOUCHED_CRATES}"
           if [ "$selection" = "__NONE__" ]; then
-            echo "No root-workspace Rust crates selected; nothing to test."
-            exit 0
-          elif [ "$selection" = "__WORKSPACE__" ] || [ -z "$selection" ]; then
+            if [ -n "$INPUT_TEST_FILTER" ]; then
+              selection="__WORKSPACE__"
+            else
+              echo "No root-workspace Rust crates selected; nothing to test."
+              exit 0
+            fi
+          fi
+          if [ "$selection" = "__WORKSPACE__" ] || [ -z "$selection" ]; then
             crate_args=(--workspace)
             has_mod_package=true
           else
@@ -801,7 +845,7 @@ jobs:
             cargo build --locked -p horizon-mod-package --features runtime-process --example holder_actor
           fi
 
-          if [ "$INPUT_MODE" = "quick" ]; then
+          if [ "$INPUT_MODE" = "quick" ] && [ -z "$INPUT_TEST_FILTER" ]; then
             echo "Running cargo check --locked ${crate_args[*]} --all-targets"
             cargo check --locked "${crate_args[@]}" --all-targets
           fi
@@ -811,13 +855,20 @@ jobs:
             test_cmd+=(--features horizon-mod-package/index)
           fi
           if [ -n "$INPUT_TEST_FILTER" ]; then
-            test_cmd+=("$INPUT_TEST_FILTER")
+            read -r -a filter_args <<< "$INPUT_TEST_FILTER"
+            test_cmd+=("${filter_args[@]}")
           fi
           if [ "$INPUT_RUN_IGNORED" = "true" ]; then
             test_cmd+=(-- --ignored)
           fi
           echo "Running ${test_cmd[*]}"
           "${test_cmd[@]}"
+
+          if [ "$INPUT_MODE" = "verify" ] && [ -z "$INPUT_TEST_FILTER" ]; then
+            doc_cmd=(cargo test --locked "${crate_args[@]}" --doc)
+            echo "Running ${doc_cmd[*]}"
+            "${doc_cmd[@]}"
+          fi
 
   launcher:
     name: "Launcher (verify)"
@@ -826,7 +877,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Ensure sufficient disk space on ubuntu-latest
+      - name: Ensure sufficient disk space and swap on ubuntu-latest
         run: |
           set -euo pipefail
           avail_gb=$(df -BG --output=avail / | tail -n 1 | tr -dc '0-9')
@@ -842,14 +893,20 @@ jobs:
           fi
           swap_mb=$(free -m | awk '/^Swap:/{print $2}')
           if [ "${swap_mb:-0}" -lt 4096 ]; then
-            echo "Enabling 8G swapfile (current swap: ${swap_mb:-0}M) to guard against link-time OOM..."
-            sudo fallocate -l 8G /swapfile_ci
-            sudo chmod 600 /swapfile_ci
-            sudo mkswap /swapfile_ci >/dev/null
-            sudo swapon /swapfile_ci
+            mnt_gb=$(df -BG --output=avail /mnt 2>/dev/null | tail -n 1 | tr -dc '0-9' || echo 0)
+            if [ -d /mnt ] && [ "${mnt_gb:-0}" -ge 12 ]; then
+              swap_path=/mnt/swapfile_ci
+            else
+              swap_path=/swapfile_ci
+            fi
+            echo "Enabling 8G swapfile at ${swap_path} (current swap: ${swap_mb:-0}M)..."
+            sudo fallocate -l 8G "$swap_path"
+            sudo chmod 600 "$swap_path"
+            sudo mkswap "$swap_path" >/dev/null
+            sudo swapon "$swap_path"
           fi
           free -h
-          df -h /
+          df -h / /mnt 2>/dev/null || df -h /
 
       - name: Checkout target ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -862,9 +919,11 @@ jobs:
         run: |
           set -euo pipefail
           scratch="$RUNNER_TEMP/horizon-launcher-scratch"
-          mkdir -p "$scratch/home" "$scratch/data" "$scratch/config" "$scratch/trash" "$scratch/clipboard" "$scratch/desktop"
+          mkdir -p "$scratch/home" "$scratch/game-home" "$scratch/data" "$scratch/config" "$scratch/trash" "$scratch/clipboard" "$scratch/desktop"
           {
+            echo "HORIZON_HOME=$scratch/game-home"
             echo "HORIZON_LAUNCHER_HOME=$scratch/home"
+            echo "HORIZON_LAUNCHER_LOCATION_FILE=$scratch/location.txt"
             echo "XDG_DATA_HOME=$scratch/data"
             echo "XDG_CONFIG_HOME=$scratch/config"
             echo "HORIZON_LAUNCHER_TRASH=$scratch/trash"
@@ -889,19 +948,22 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: launcher
-          shared-key: fork-pr-checks-launcher-v1
+          shared-key: fork-pr-checks-launcher-v2
+          cache-bin: false
           cache-on-failure: true
           save-if: true
 
       - name: Check, clippy, and test launcher
         working-directory: launcher
-        env:
-          RUSTC_BOOTSTRAP: "1"
         run: |
           set -euo pipefail
           cargo fmt -- --check
-          cargo clippy --locked --all-targets -- -D warnings
-          cargo test --locked
+          if [ -f ../tools/ci/check_warnings.py ]; then
+            python3 ../tools/ci/check_warnings.py cargo clippy --locked --keep-going --all-targets
+          else
+            cargo clippy --locked --all-targets -- -D warnings
+          fi
+          cargo test --locked --lib --bins --tests
 
   mod-api:
     name: "Mod API check"
@@ -912,7 +974,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Ensure sufficient disk space on ubuntu-latest
+      - name: Ensure sufficient disk space and swap on ubuntu-latest
         run: |
           set -euo pipefail
           avail_gb=$(df -BG --output=avail / | tail -n 1 | tr -dc '0-9')
@@ -928,14 +990,20 @@ jobs:
           fi
           swap_mb=$(free -m | awk '/^Swap:/{print $2}')
           if [ "${swap_mb:-0}" -lt 4096 ]; then
-            echo "Enabling 8G swapfile (current swap: ${swap_mb:-0}M) to guard against link-time OOM..."
-            sudo fallocate -l 8G /swapfile_ci
-            sudo chmod 600 /swapfile_ci
-            sudo mkswap /swapfile_ci >/dev/null
-            sudo swapon /swapfile_ci
+            mnt_gb=$(df -BG --output=avail /mnt 2>/dev/null | tail -n 1 | tr -dc '0-9' || echo 0)
+            if [ -d /mnt ] && [ "${mnt_gb:-0}" -ge 12 ]; then
+              swap_path=/mnt/swapfile_ci
+            else
+              swap_path=/swapfile_ci
+            fi
+            echo "Enabling 8G swapfile at ${swap_path} (current swap: ${swap_mb:-0}M)..."
+            sudo fallocate -l 8G "$swap_path"
+            sudo chmod 600 "$swap_path"
+            sudo mkswap "$swap_path" >/dev/null
+            sudo swapon "$swap_path"
           fi
           free -h
-          df -h /
+          df -h / /mnt 2>/dev/null || df -h /
 
       - name: Checkout target ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -959,26 +1027,10 @@ jobs:
           fi
           echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
 
-      - name: Set up sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
-      - name: Configure sccache wrapper
-        run: |
-          set -euo pipefail
-          {
-            echo "SCCACHE_GHA_ENABLED=true"
-            if [ -f "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh" ]; then
-              chmod +x "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
-              echo "RUSTC_WRAPPER=$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
-            else
-              echo "RUSTC_WRAPPER=sccache"
-            fi
-          } >> "$GITHUB_ENV"
-
-      - name: Restore shared Cargo registry cache
+      - name: Restore shared root Cargo cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: fork-pr-checks-tests-v1
+          shared-key: fork-pr-checks-root-v2
           cache-on-failure: false
           save-if: false
 
@@ -1011,7 +1063,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - name: Ensure sufficient disk space on ubuntu-latest
+      - name: Ensure sufficient disk space and swap on ubuntu-latest
         run: |
           set -euo pipefail
           avail_gb=$(df -BG --output=avail / | tail -n 1 | tr -dc '0-9')
@@ -1027,14 +1079,20 @@ jobs:
           fi
           swap_mb=$(free -m | awk '/^Swap:/{print $2}')
           if [ "${swap_mb:-0}" -lt 4096 ]; then
-            echo "Enabling 8G swapfile (current swap: ${swap_mb:-0}M) to guard against link-time OOM..."
-            sudo fallocate -l 8G /swapfile_ci
-            sudo chmod 600 /swapfile_ci
-            sudo mkswap /swapfile_ci >/dev/null
-            sudo swapon /swapfile_ci
+            mnt_gb=$(df -BG --output=avail /mnt 2>/dev/null | tail -n 1 | tr -dc '0-9' || echo 0)
+            if [ -d /mnt ] && [ "${mnt_gb:-0}" -ge 12 ]; then
+              swap_path=/mnt/swapfile_ci
+            else
+              swap_path=/swapfile_ci
+            fi
+            echo "Enabling 8G swapfile at ${swap_path} (current swap: ${swap_mb:-0}M)..."
+            sudo fallocate -l 8G "$swap_path"
+            sudo chmod 600 "$swap_path"
+            sudo mkswap "$swap_path" >/dev/null
+            sudo swapon "$swap_path"
           fi
           free -h
-          df -h /
+          df -h / /mnt 2>/dev/null || df -h /
 
       - name: Checkout target ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1057,26 +1115,10 @@ jobs:
           fi
           echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
 
-      - name: Set up sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
-      - name: Configure sccache wrapper
-        run: |
-          set -euo pipefail
-          {
-            echo "SCCACHE_GHA_ENABLED=true"
-            if [ -f "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh" ]; then
-              chmod +x "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
-              echo "RUSTC_WRAPPER=$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
-            else
-              echo "RUSTC_WRAPPER=sccache"
-            fi
-          } >> "$GITHUB_ENV"
-
-      - name: Restore shared Cargo registry cache
+      - name: Restore shared root Cargo cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: fork-pr-checks-tests-v1
+          shared-key: fork-pr-checks-root-v2
           cache-on-failure: false
           save-if: false
 
