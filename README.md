@@ -15,7 +15,7 @@ Every dispatch runs a lightweight `scope` job (~15s), then fans out across `ubun
 
 ### Upstream Base Safety
 
-`scope` fetches `horizon-rust/horizon` (`base`, default `main`) and fails closed if upstream is unreachable so diffs, touched-crate selection, and layer/mod-API baselines are never silently taken against a stale fork branch. Pass `-f allow_fork_base_fallback=true` (`--allow-fork-base`) only when upstream is known to be temporarily unavailable and `fork/<base>` is up to date; fallback runs print a prominent warning banner in the Job Summary.
+`scope` tries to fetch `horizon-rust/horizon` (`base`, default `main`) first and automatically falls back to fork `origin/<base>` with a prominent warning banner in the Job Summary if upstream cannot be fetched (`allow_fork_base_fallback=true` by default). Pass `-f allow_fork_base_fallback=false` (`--strict-upstream`) to fail closed instead.
 
 ### Caching (3 `rust-cache` Keys + Selective `sccache`)
 

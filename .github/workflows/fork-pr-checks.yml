@@ -58,9 +58,9 @@ on:
         default: false
         type: boolean
       allow_fork_base_fallback:
-        description: Allow falling back to fork origin/<base> if upstream horizon-rust/horizon cannot be fetched
+        description: Fall back to fork origin/<base> if upstream horizon-rust/horizon cannot be fetched
         required: false
-        default: false
+        default: true
         type: boolean
 
 permissions:
@@ -218,7 +218,7 @@ jobs:
             echo ""
             if [ "$base_fallback" = "true" ]; then
               echo "> [!WARNING]"
-              echo "> **Upstream fetch failed (`horizon-rust/horizon:${INPUT_BASE}`).** Diffing against fork \`origin/${INPUT_BASE}\` (\`${BASE_SHA:0:12}\`) because \`allow_fork_base_fallback=true\` was set. Verify \`fork/${INPUT_BASE}\` matches upstream before trusting scope or baselines."
+              echo "> **Upstream fetch failed (`horizon-rust/horizon:${INPUT_BASE}`).** Automatically fell back to fork \`origin/${INPUT_BASE}\` (\`${BASE_SHA:0:12}\`). Verify \`fork/${INPUT_BASE}\` matches upstream before trusting scope or baselines."
               echo ""
             fi
             echo "- **Ref:** \`${INPUT_REF}\` (\`${HEAD_SHA:0:12}\`)"
