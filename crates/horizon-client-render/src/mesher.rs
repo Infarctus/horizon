@@ -1016,11 +1016,22 @@ impl StateFlags {
 
     #[inline]
     fn from_info(info: &Info) -> Self {
-        let bits = u8::from(info.leaves) * Self::LEAF
-            | u8::from(info.opaque_cube) * Self::OPAQUE_CUBE
-            | u8::from(info.block_entity) * Self::BLOCK_ENTITY
-            | u8::from(info.emission > 0) * Self::EMITS_LIGHT
-            | u8::from(info.opaque_ice) * Self::OPAQUE_ICE;
+        let mut bits = 0;
+        if info.leaves {
+            bits |= Self::LEAF;
+        }
+        if info.opaque_cube {
+            bits |= Self::OPAQUE_CUBE;
+        }
+        if info.block_entity {
+            bits |= Self::BLOCK_ENTITY;
+        }
+        if info.emission > 0 {
+            bits |= Self::EMITS_LIGHT;
+        }
+        if info.opaque_ice {
+            bits |= Self::OPAQUE_ICE;
+        }
         Self(bits)
     }
 
