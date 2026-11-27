@@ -155,11 +155,13 @@ fn fixture() -> (Scratch, Assets, RenderAssets, MeshTables, Biomes) {
         },
     ];
     let ao_info = lighting::AoInfo::build_table(&info);
+    let state_flags = StateFlags::build_table(&info);
     let tables = MeshTables {
         info,
         solid: vec![false; 3],
         full_faces: vec![0; 3],
         ao_info,
+        state_flags,
         visibility: FaceVisibility::empty(),
         water_still: 0,
         water_flow: 0,
@@ -614,6 +616,7 @@ fn smooth_lighting_compact_ao_and_precomputed_cull_match_fallback_byte_for_byte(
         } else {
             Vec::new()
         },
+        state_flags: StateFlags::build_table(&info),
         info,
         visibility: FaceVisibility::empty(),
         water_still: 0,
@@ -996,6 +999,7 @@ fn models_mut_face_cull_direction_edit_refreshes_mesher_culling() {
             .map(|i| (0..6).fold(0, |bits, d| bits | u8::from(i.face[d] == 1) << d))
             .collect(),
         ao_info: lighting::AoInfo::build_table(&info),
+        state_flags: StateFlags::build_table(&info),
         info,
         visibility: FaceVisibility::empty(),
         water_still: 0,
@@ -1102,4 +1106,404 @@ fn models_mut_face_cull_direction_edit_refreshes_mesher_culling() {
         refreshed_ptr,
         render.model_catalog.cull_flags().as_ptr()
     ));
+}
+
+#[test]
+fn hidden_row_bypass_preserves_geometry_block_entities_and_lights() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = |rel: &str, value: serde_json::Value| {
+        let full = dir.path().join(rel);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, value.to_string()).unwrap();
+    };
+    let registry = json!({
+        "defaults": {
+            "minecraft:air": 0,
+            "fixture:solid": 1,
+            "fixture:be": 2,
+            "fixture:lamp": 3,
+            "fixture:be_lamp": 4,
+            "fixture:leaf": 5
+        },
+        "states": [
+            ["air", true, false, "", "minecraft:air"],
+            ["solid", false, false, "", "fixture:solid"],
+            ["be", false, false, "", "fixture:be"],
+            ["lamp", false, false, "", "fixture:lamp"],
+            ["be_lamp", false, false, "", "fixture:be_lamp"],
+            ["leaf", false, false, "", "fixture:leaf"]
+        ]
+    });
+    let registry = Box::leak(Box::new(
+        BlockRegistry::from_facts_json(registry.to_string().as_bytes()).unwrap(),
+    ));
+
+    write(
+        "assets/fixture/models/block/cube.json",
+        json!({
+            "textures": {"all": "fixture:block/shared"},
+            "elements": [{
+                "from": [0, 0, 0], "to": [16, 16, 16],
+                "faces": {
+                    "down": {"texture": "#all", "cullface": "down"},
+                    "up": {"texture": "#all", "cullface": "up"},
+                    "north": {"texture": "#all", "cullface": "north"},
+                    "south": {"texture": "#all", "cullface": "south"},
+                    "west": {"texture": "#all", "cullface": "west"},
+                    "east": {"texture": "#all", "cullface": "east"}
+                }
+            }]
+        }),
+    );
+    let names = ["solid", "be", "lamp", "be_lamp", "leaf"];
+    for name in names {
+        write(
+            &format!("assets/fixture/blockstates/{name}.json"),
+            json!({"variants": {"": {"model": "fixture:block/cube"}}}),
+        );
+    }
+
+    let encode = |file: PathBuf| {
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let mut encoder = png::Encoder::new(std::fs::File::create(file).unwrap(), 1, 1);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .write_header()
+            .unwrap()
+            .write_image_data(&[200, 180, 160, 255])
+            .unwrap();
+    };
+    encode(dir.path().join("assets/fixture/textures/block/shared.png"));
+    for name in ["grass", "foliage", "dry_foliage"] {
+        encode(
+            dir.path()
+                .join(format!("assets/minecraft/textures/colormap/{name}.png")),
+        );
+    }
+    write(
+        "data/minecraft/worldgen/biome/plains.json",
+        json!({"temperature": 0.5, "downfall": 0.5, "effects": {"water_color": 4159204}}),
+    );
+
+    let full_names = [
+        "fixture:solid",
+        "fixture:be",
+        "fixture:lamp",
+        "fixture:be_lamp",
+        "fixture:leaf",
+    ];
+    let facts: BTreeMap<String, serde_json::Value> = full_names
+        .iter()
+        .map(|&name| (name.into(), json!({"schema": {}, "states": [{}]})))
+        .collect();
+    let mut sprites = crate::sprites::Sprites::default();
+    let catalog = crate::models::StateModels::from_facts(
+        &horizon_assets::resource_source::ResourceSource::directory(dir.path().to_path_buf()),
+        registry,
+        &full_names,
+        &mut sprites,
+        &facts,
+    )
+    .unwrap();
+    let render = RenderAssets {
+        sprite_size: 1,
+        sprite_minimum_size: 1,
+        pixels: SpritePixels::new(vec![255; 4]),
+        texture_layers: 1,
+        model_catalog: catalog,
+        model_library: Err("unused synthetic item models".into()),
+        model_placements: vec![],
+        model_gallery: vec![],
+        animations: vec![],
+        sprite_layers: BTreeMap::new(),
+        emissive: vec![],
+        translucent_layers: vec![false],
+        sprite_mips: vec![],
+        pbr_normals: vec![],
+        pbr_specular: vec![],
+        pbr_size: 1,
+        connected: Default::default(),
+        fusion: Default::default(),
+        better_grass: None,
+        mod_animations: Default::default(),
+        mod_pipelines: Default::default(),
+        generation: 1,
+    };
+    let assets = Assets {
+        registry,
+        properties: Properties::for_tests(&[
+            (true, false, false, false),
+            (false, false, true, true),
+            (false, false, true, true),
+            (false, false, true, true),
+            (false, false, true, true),
+            (false, false, false, false),
+        ]),
+        material_states: [BlockStateId(0); 6],
+        blocks_fluid_flow: Default::default(),
+    };
+    let biomes = Biomes::load(&horizon_assets::resource_source::ResourceRoot::directory(
+        dir.path().to_path_buf(),
+    ))
+    .unwrap();
+
+    let air = Info {
+        solid: false,
+        full: false,
+        permeable: true,
+        shade: 1.0,
+        emission: 0,
+        tier: 0,
+        emissive: false,
+        fluid: FluidState::EMPTY,
+        model: false,
+        block_entity: false,
+        tints: [Tint::None; 2],
+        tint_count: 0,
+        colormap: None,
+        offset: None,
+        legacy_solid: false,
+        overlay: false,
+        leaves: false,
+        pane: false,
+        opaque_cube: false,
+        blocks_flow: false,
+        ice: false,
+        opaque_ice: false,
+        sturdy: 0,
+        face: [0; 6],
+        cover: [0.0; 6],
+    };
+    let solid_base = Info {
+        solid: true,
+        full: true,
+        permeable: false,
+        shade: 0.2,
+        model: true,
+        opaque_cube: true,
+        face: [1; 6],
+        ..air
+    };
+    const SOLID: u32 = 1;
+    const BE: u32 = 2;
+    const LAMP: u32 = 3;
+    const BE_LAMP: u32 = 4;
+    const LEAF: u32 = 5;
+    let info = vec![
+        air,
+        solid_base,
+        Info {
+            block_entity: true,
+            ..solid_base
+        },
+        Info {
+            emission: 15,
+            ..solid_base
+        },
+        Info {
+            block_entity: true,
+            emission: 12,
+            ..solid_base
+        },
+        Info {
+            leaves: true,
+            model: true,
+            ..air
+        },
+    ];
+    let tables = MeshTables {
+        solid: info.iter().map(|i| i.solid).collect(),
+        full_faces: info
+            .iter()
+            .map(|i| (0..6).fold(0, |bits, d| bits | u8::from(i.face[d] == 1) << d))
+            .collect(),
+        ao_info: lighting::AoInfo::build_table(&info),
+        state_flags: StateFlags::build_table(&info),
+        info,
+        visibility: FaceVisibility::empty(),
+        water_still: 0,
+        water_flow: 0,
+        water_overlay: 0,
+        lava_still: 0,
+        lava_flow: 0,
+        animated_layers: vec![false],
+        colormaps: Vec::new(),
+        water_colormap: None,
+        mod_fluids: vec![],
+        mod_tints: Default::default(),
+        section_geometry: std::sync::Arc::new([]),
+    };
+
+    let layout = crate::chunk::ColumnLayout::new(0, 48).unwrap();
+    let solid_chunk = || {
+        let mut chunk = Chunk::with_layout(0, 0, layout);
+        for y in 0..48 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    chunk.set(x, y, z, SOLID);
+                }
+            }
+        }
+        chunk
+    };
+    let neighbor = solid_chunk();
+
+    // Case 1: `!has_special` — fully hidden rows (`0xFFFF`) + one partially-hidden row around an air cavity at (10, 20, 8).
+    let mut plain = solid_chunk();
+    plain.set(10, 20, 8, 0);
+    let mut scratch = MeshScratch::default();
+    let make_mesher = |hidden_states: &'static [bool], leaf_culling: LeafCullingMode| Mesher {
+        hidden_states,
+        part_tables: Default::default(),
+        nether_shading: false,
+        shader_pack_lighting: false,
+        separate_ao: false,
+        shader_pack: false,
+        looks: false,
+        assets: &assets,
+        render: &render,
+        tables: &tables,
+        biomes: &biomes,
+        visibility: FaceVisibility::empty(),
+        zoom: BiomeZoom::new(0),
+        blend_radius: 0,
+        smooth_lighting: false,
+        cutout_leaves: true,
+        opaque_ice: false,
+        translucent_layers: &[],
+        leaf_culling,
+        // Note: `hidden_states` and `leaf_culling` are varied per case below.
+    };
+    fn region_of<'a>(center: &'a Chunk, neighbor: &'a Chunk) -> [[Option<&'a Chunk>; 3]; 3] {
+        let mut r = [[Some(neighbor); 3]; 3];
+        r[1][1] = Some(center);
+        r
+    }
+
+    let plain_mesh = make_mesher(&[], LeafCullingMode::Off).mesh_reusing(
+        &region_of(&plain, &neighbor),
+        1,
+        SectionMesh::default(),
+        &mut scratch,
+    );
+    assert_eq!(plain_mesh.solid.len() / 4, 6);
+    assert!(plain_mesh.block_entities.is_empty());
+    assert!(plain_mesh.lights.is_empty());
+
+    // Case 2: `has_special` — mix of fully-hidden row (y=20, z=4) and partially-hidden row (y=20, z=8)
+    // containing enclosed & exposed block entities, emitters, plain solid blocks, and air.
+    let mut special = plain.clone();
+    // Fully hidden row (y=20, z=4): hidden_row == 0xFFFF.
+    special.set(3, 20, 4, BE);
+    special.set(7, 20, 4, LAMP);
+    special.set(12, 20, 4, BE_LAMP);
+    // Partially hidden row (y=20, z=8): air at x=10 exposes x=9 and x=11 while x=0..9 and 12..16 are hidden.
+    special.set(2, 20, 8, BE);
+    special.set(5, 20, 8, LAMP);
+    special.set(9, 20, 8, BE_LAMP);
+    special.set(14, 20, 8, BE);
+
+    let special_mesh = make_mesher(&[], LeafCullingMode::Off).mesh_reusing(
+        &region_of(&special, &neighbor),
+        1,
+        plain_mesh,
+        &mut scratch,
+    );
+    assert_eq!(special_mesh.solid.len() / 4, 6);
+    assert_eq!(
+        special_mesh.block_entities,
+        vec![
+            ([3, 20, 4], BE),
+            ([12, 20, 4], BE_LAMP),
+            ([2, 20, 8], BE),
+            ([9, 20, 8], BE_LAMP),
+            ([14, 20, 8], BE),
+        ]
+    );
+    assert_eq!(
+        special_mesh.lights,
+        vec![
+            ([7, 20, 4], LAMP),
+            ([12, 20, 4], BE_LAMP),
+            ([5, 20, 8], LAMP),
+            ([9, 20, 8], BE_LAMP),
+        ]
+    );
+
+    // Case 3: `hidden_states` hides `BE_LAMP`: it disappears from block_entities/lights
+    // and exposes the faces around both (12, 20, 4) (+6 faces) and (9, 20, 8) (+4 net faces,
+    // since (9, 20, 8) shares a face with the existing cavity at (10, 20, 8)).
+    static HIDE_BE_LAMP: [bool; 6] = [false, false, false, false, true, false];
+    let hidden_special_mesh = make_mesher(&HIDE_BE_LAMP, LeafCullingMode::Off).mesh_reusing(
+        &region_of(&special, &neighbor),
+        1,
+        special_mesh,
+        &mut scratch,
+    );
+    assert_eq!(hidden_special_mesh.solid.len() / 4, 6 + 6 + 4);
+    assert_eq!(
+        hidden_special_mesh.block_entities,
+        vec![([3, 20, 4], BE), ([2, 20, 8], BE), ([14, 20, 8], BE)]
+    );
+    assert_eq!(
+        hidden_special_mesh.lights,
+        vec![([7, 20, 4], LAMP), ([5, 20, 8], LAMP)]
+    );
+
+    // Case 4: `hidden_states` hiding the only leaf in a section under Solid & SolidAggressive,
+    // plus `MeshScratch` reuse from a leaf section into a non-leaf section.
+    let mut leaves_chunk = Chunk::with_layout(0, 0, layout);
+    for y in 20..23 {
+        for z in 6..=8 {
+            for x in 6..=8 {
+                leaves_chunk.set(x, y, z, LEAF);
+            }
+        }
+    }
+    static HIDE_LEAF: [bool; 6] = [false, false, false, false, false, true];
+    let mut out = hidden_special_mesh;
+    for mode in [LeafCullingMode::Solid, LeafCullingMode::SolidAggressive] {
+        out = make_mesher(&[], mode).mesh_reusing(
+            &region_of(&leaves_chunk, &neighbor),
+            1,
+            out,
+            &mut scratch,
+        );
+        assert!(scratch.leaf.is_active(), "{mode:?}");
+        assert!(
+            out.solid.iter().any(|v| v.layer & OPAQUE_LAYER != 0),
+            "interior leaf should solidify under {mode:?}"
+        );
+        // Hide the only leaf state: palette still has `LEAF`, so `assume_leaves` is false
+        // and the post-hidden scan must deactivate the mask and emit zero quads.
+        out = make_mesher(&HIDE_LEAF, mode).mesh_reusing(
+            &region_of(&leaves_chunk, &neighbor),
+            1,
+            out,
+            &mut scratch,
+        );
+        assert!(!scratch.leaf.is_active(), "{mode:?}");
+        assert!(
+            out.solid.is_empty(),
+            "hidden leaf emitted quads in {mode:?}"
+        );
+        // Re-enable leaves, then reuse `scratch` on a non-leaf section (`plain`):
+        // palette check skips `LeafMask::prepare` and deactivates `scratch.leaf`.
+        out = make_mesher(&[], mode).mesh_reusing(
+            &region_of(&leaves_chunk, &neighbor),
+            1,
+            out,
+            &mut scratch,
+        );
+        assert!(scratch.leaf.is_active(), "{mode:?}");
+        out = make_mesher(&[], mode).mesh_reusing(
+            &region_of(&plain, &neighbor),
+            1,
+            out,
+            &mut scratch,
+        );
+        assert!(!scratch.leaf.is_active(), "{mode:?}");
+        assert_eq!(out.solid.len() / 4, 6);
+    }
 }

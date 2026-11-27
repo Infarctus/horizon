@@ -1000,6 +1000,77 @@ struct Info {
     /// the full width (vertical faces: 1 when the whole square is covered).
     cover: [f32; 6],
 }
+/// Per-state flags read in hot meshing and leaf-culling loops, packed into one
+/// byte (~30 KiB total) so the table stays in L1D instead of striding across
+/// the ~3 MiB [`Info`] table.
+#[derive(Clone, Copy, Debug)]
+struct StateFlags(u8);
+impl StateFlags {
+    const LEAF: u8 = 1 << 0;
+    const OPAQUE_CUBE: u8 = 1 << 1;
+    const BLOCK_ENTITY: u8 = 1 << 2;
+    const EMITS_LIGHT: u8 = 1 << 3;
+    const OPAQUE_ICE: u8 = 1 << 4;
+    const SPECIAL: u8 = Self::BLOCK_ENTITY | Self::EMITS_LIGHT;
+    const LEAF_OR_OPAQUE: u8 = Self::LEAF | Self::OPAQUE_CUBE;
+
+    #[inline]
+    fn from_info(info: &Info) -> Self {
+        let bits = u8::from(info.leaves) * Self::LEAF
+            | u8::from(info.opaque_cube) * Self::OPAQUE_CUBE
+            | u8::from(info.block_entity) * Self::BLOCK_ENTITY
+            | u8::from(info.emission > 0) * Self::EMITS_LIGHT
+            | u8::from(info.opaque_ice) * Self::OPAQUE_ICE;
+        Self(bits)
+    }
+
+    fn build_table(info: &[Info]) -> Vec<Self> {
+        info.iter().map(Self::from_info).collect()
+    }
+
+    #[inline]
+    const fn is_leaf(self) -> bool {
+        self.0 & Self::LEAF != 0
+    }
+
+    #[inline]
+    const fn is_block_entity(self) -> bool {
+        self.0 & Self::BLOCK_ENTITY != 0
+    }
+
+    #[inline]
+    const fn emits_light(self) -> bool {
+        self.0 & Self::EMITS_LIGHT != 0
+    }
+
+    #[inline]
+    const fn is_opaque_ice(self) -> bool {
+        self.0 & Self::OPAQUE_ICE != 0
+    }
+
+    #[inline]
+    const fn is_special(self) -> bool {
+        self.0 & Self::SPECIAL != 0
+    }
+
+    #[inline]
+    const fn is_leaf_or_opaque(self) -> bool {
+        self.0 & Self::LEAF_OR_OPAQUE != 0
+    }
+
+    /// Classifies the state for [`leaf_culling::LeafMask`]: `leaves` takes
+    /// precedence over `opaque_cube` if both bits are ever set.
+    #[inline]
+    const fn leaf_cell(self) -> leaf_culling::Cell {
+        const CELLS: [leaf_culling::Cell; 4] = [
+            leaf_culling::Cell::Open,
+            leaf_culling::Cell::Leaf,
+            leaf_culling::Cell::Opaque,
+            leaf_culling::Cell::Leaf,
+        ];
+        CELLS[(self.0 & Self::LEAF_OR_OPAQUE) as usize]
+    }
+}
 /// Derived per-state facts, exposed for the section-mesh parity gate.
 #[derive(Clone, Copy, Debug)]
 pub struct MeshFacts {
@@ -1026,6 +1097,9 @@ pub struct MeshTables {
     /// keeping `lighting::ambient_occlusion`'s random neighbour lookups in L1D cache.
     /// Empty if any state cannot be represented losslessly (falls back to `info`).
     ao_info: Vec<lighting::AoInfo>,
+    /// Per-state flags packed into one byte each (`StateFlags`) so hidden-block
+    /// checks, leaf culling, and neighbour face culling stay in L1D cache.
+    state_flags: Vec<StateFlags>,
     pub visibility: FaceVisibility,
     water_still: u16,
     water_flow: u16,
@@ -1329,6 +1403,7 @@ impl MeshTables {
                 .map(|i| (0..6).fold(0, |bits, d| bits | u8::from(i.face[d] == 1) << d))
                 .collect(),
             ao_info: lighting::AoInfo::build_table(&info),
+            state_flags: StateFlags::build_table(&info),
             info,
             visibility,
             water_still: layer("minecraft:block/water_still")?,
@@ -1845,6 +1920,15 @@ fn row_masks(rows: &[u32]) -> ([u16; 256], [u16; 256]) {
         }
     }
     (open, hidden)
+}
+/// Bitmask of non-air (`id != 0`) cells in a 16-block inner X row.
+#[inline]
+fn non_air_row(blocks: &[u32; 16]) -> u16 {
+    let mut mask = 0u16;
+    for (x, &id) in blocks.iter().enumerate() {
+        mask |= u16::from(id != 0) << x;
+    }
+    mask
 }
 #[cfg(test)]
 #[test]
@@ -2606,12 +2690,36 @@ impl Mesher<'_> {
         let opaque = &scratch.solid_rows;
         let (open, hidden) = row_masks(opaque);
         out.visibility = visibility_rows(&open);
+        let info = &self.tables.info;
+        let state_flags = &self.tables.state_flags;
+        let full_faces = &self.tables.full_faces;
         if self.leaf_culling.is_interior() {
-            scratch
-                .leaf
-                .prepare(self.leaf_culling, pad, &self.tables.info, region, base_y);
+            let is_global = section.blocks.is_global();
+            let maybe_leaves = is_global
+                || section
+                    .blocks
+                    .maybe_has(|id| state_flags.get(id as usize).is_some_and(|f| f.is_leaf()));
+            if maybe_leaves {
+                let assume_leaves = !is_global && self.hidden_states.is_empty();
+                scratch.leaf.prepare(
+                    self.leaf_culling,
+                    pad,
+                    state_flags,
+                    region,
+                    base_y,
+                    assume_leaves,
+                );
+            } else {
+                scratch.leaf.deactivate();
+            }
+        } else {
+            scratch.leaf.deactivate();
         }
         let leaf = &scratch.leaf;
+        let has_special = section.blocks.is_global()
+            || section
+                .blocks
+                .maybe_has(|id| state_flags.get(id as usize).is_some_and(|f| f.is_special()));
         let mut tints = Tints::take_from(
             &mut scratch.tints,
             region,
@@ -2621,8 +2729,6 @@ impl Mesher<'_> {
             [center.x, center.z, base_y],
         )
         .with_colormaps(self.tables);
-        let info = &self.tables.info;
-        let full_faces = &self.tables.full_faces;
         let catalog = &self.render.model_catalog;
         let better_grass = self.render.better_grass.as_ref().and_then(|rules| {
             let mode = rules.resolve(scratch.better_grass_mode);
@@ -2632,27 +2738,66 @@ impl Mesher<'_> {
         let mut model_slots: smallvec::SmallVec<[u32; 8]> = smallvec::SmallVec::new();
         for y in 0..16 {
             for z in 0..16 {
+                let hidden_row = hidden[(y * 16 + z) as usize];
                 // The padded index of the row's x = 0 cell: `pi(x, y, z)` is
                 // `row + x` and a neighbour adds `OFFSETS[d]`.
                 let row = pi(0, y, z);
-                for x in 0..16 {
-                    let cell = row + x as usize;
-                    let id = pad.blocks[cell];
+                if hidden_row == 0xFFFF {
+                    if has_special {
+                        let row_blocks: &[u32; 16] = pad.blocks[row..row + 16]
+                            .try_into()
+                            .expect("inner row has 16 blocks");
+                        for (x, &id) in row_blocks.iter().enumerate() {
+                            if id == 0 {
+                                continue;
+                            }
+                            let flags = state_flags[id as usize];
+                            if flags.is_special() {
+                                let pos = [center.x * 16 + x as i32, base_y + y, center.z * 16 + z];
+                                if flags.is_block_entity() {
+                                    out.block_entities.push((pos, id));
+                                }
+                                if flags.emits_light() {
+                                    out.lights.push((pos, id));
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                let row_blocks: &[u32; 16] = pad.blocks[row..row + 16]
+                    .try_into()
+                    .expect("inner row has 16 blocks");
+                let mut active = if has_special || hidden_row == 0 {
+                    non_air_row(row_blocks)
+                } else {
+                    !hidden_row
+                };
+                while active != 0 {
+                    let xi = active.trailing_zeros() as usize;
+                    active &= active - 1;
+                    let id = row_blocks[xi];
                     if id == 0 {
                         continue;
                     }
+                    let x = xi as i32;
+                    if has_special {
+                        let flags = state_flags[id as usize];
+                        if flags.is_special() {
+                            let pos = [center.x * 16 + x, base_y + y, center.z * 16 + z];
+                            if flags.is_block_entity() {
+                                out.block_entities.push((pos, id));
+                            }
+                            if flags.emits_light() {
+                                out.lights.push((pos, id));
+                            }
+                        }
+                        if hidden_row >> xi & 1 != 0 {
+                            continue;
+                        }
+                    }
+                    let cell = row + xi;
                     let state = &info[id as usize];
-                    if state.block_entity {
-                        out.block_entities
-                            .push(([center.x * 16 + x, base_y + y, center.z * 16 + z], id));
-                    }
-                    if state.emission > 0 {
-                        out.lights
-                            .push(([center.x * 16 + x, base_y + y, center.z * 16 + z], id));
-                    }
-                    if hidden[(y * 16 + z) as usize] >> x & 1 != 0 {
-                        continue;
-                    }
                     if state.fluid.kind() != FluidKind::Empty {
                         let blocks = &pad.blocks;
                         // Fast path: a fluid cell surrounded on all 6 sides by the exact
@@ -2727,30 +2872,37 @@ impl Mesher<'_> {
                             if full_faces[neighbor as usize] >> opposite & 1 != 0 {
                                 continue;
                             }
-                            let other = &info[neighbor as usize];
-                            // LeavesBlock.skipRendering with opaque leaves.
-                            let opaque_leaves = !self.cutout_leaves && state.leaves && other.leaves;
-                            // Opaque Ice: faces between two ice blocks are hidden, as they are
-                            // between two opaque blocks.
-                            let opaque_ice =
-                                self.opaque_ice && state.opaque_ice && other.opaque_ice;
-                            let culled_leaf = match self.leaf_culling {
-                                LeafCullingMode::Hollow | LeafCullingMode::Hidden => {
-                                    state.leaves
-                                        && other.leaves
-                                        && leaf_culling::in_section(x + dx, y + dy, z + dz)
-                                        && (self.leaf_culling == LeafCullingMode::Hollow
-                                            || leaf_culling::backed(
-                                                pad,
-                                                info,
-                                                region,
-                                                base_y,
-                                                [x + 2 * dx, y + 2 * dy, z + 2 * dz],
-                                            ))
-                                }
-                                _ => false,
-                            };
-                            if opaque_leaves || opaque_ice || culled_leaf {
+                            // LeavesBlock.skipRendering with opaque leaves, leaf culling, and
+                            // Opaque Ice — read from L1-resident `state_flags` only when the
+                            // current block itself is leaves or ice.
+                            let mut skip = false;
+                            if state.leaves && state_flags[neighbor as usize].is_leaf() {
+                                skip = !self.cutout_leaves
+                                    || match self.leaf_culling {
+                                        LeafCullingMode::Hollow => {
+                                            leaf_culling::in_section(x + dx, y + dy, z + dz)
+                                        }
+                                        LeafCullingMode::Hidden => {
+                                            leaf_culling::in_section(x + dx, y + dy, z + dz)
+                                                && leaf_culling::backed(
+                                                    pad,
+                                                    state_flags,
+                                                    region,
+                                                    base_y,
+                                                    [x + 2 * dx, y + 2 * dy, z + 2 * dz],
+                                                )
+                                        }
+                                        _ => false,
+                                    };
+                            }
+                            if !skip
+                                && self.opaque_ice
+                                && state.opaque_ice
+                                && state_flags[neighbor as usize].is_opaque_ice()
+                            {
+                                skip = true;
+                            }
+                            if skip {
                                 continue;
                             }
                             let show = (state.leaves && state.face[d as usize] == 0)

@@ -3,9 +3,10 @@
 //! does, then meshes every section of the inner columns on this one thread, so a
 //! change to generation or meshing shows as time per column and per section.
 //!
-//!     cargo run --release -p horizon-client --example chunk_load_bench -- \
+//!     cargo run --release -p horizon-client-lib --example chunk_load_bench -- \
 //!         .local/horizon-client/26.3 [--seed 1234] [--center CX CZ] [--radius 8]
-//!         [--threads N] [--rounds 3] [--mesh-threads N] [--json out.json]
+//!         [--threads N] [--rounds 3] [--mesh-threads N]
+//!         [--leaf-culling off|hidden|solid|solid-aggressive|hollow] [--json out.json]
 //!
 //! The default centre is the village of `tools/perf_bench.py`. The generation
 //! figure is wall time with N workers (the game's own pool); the mesh figure is
@@ -66,6 +67,27 @@ fn main() -> Result<(), Error> {
         "--threads",
         thread::available_parallelism().map_or(2, |n| n.get()),
     );
+    let leaf_culling = match args.iter().position(|a| a == "--leaf-culling") {
+        Some(i) => {
+            let value = args
+                .get(i + 1)
+                .ok_or("--leaf-culling expects off|hidden|solid|solid-aggressive|hollow")?;
+            match value.as_str() {
+                "off" => LeafCullingMode::Off,
+                "hidden" => LeafCullingMode::Hidden,
+                "solid" => LeafCullingMode::Solid,
+                "solid-aggressive" | "solid_aggressive" => LeafCullingMode::SolidAggressive,
+                "hollow" => LeafCullingMode::Hollow,
+                other => {
+                    return Err(format!(
+                        "unknown --leaf-culling mode '{other}' (expected off|hidden|solid|solid-aggressive|hollow)"
+                    )
+                    .into());
+                }
+            }
+        }
+        None => LeafCullingMode::Off,
+    };
     let center = args
         .iter()
         .position(|a| a == "--center")
@@ -157,7 +179,7 @@ fn main() -> Result<(), Error> {
         })
         .flat_map(|region| (0..HEIGHT / 16).map(move |sy| (region.clone(), sy)))
         .collect();
-    let one = mesh_rounds(&context, seed, &regions, rounds)?;
+    let one = mesh_rounds(&context, seed, &regions, rounds, leaf_culling)?;
     let mut sorted = one.per_section.clone();
     sorted.sort_unstable();
     let pct = |p: f64| {
@@ -196,7 +218,7 @@ fn main() -> Result<(), Error> {
     // Every worker meshing at once: the throughput a world being explored gets,
     // memory bandwidth and the allocator included.
     let mesh_threads: usize = flag(&args, "--mesh-threads", threads);
-    let parallel = mesh_parallel(&context, seed, &regions, mesh_threads)?;
+    let parallel = mesh_parallel(&context, seed, &regions, mesh_threads, leaf_culling)?;
     println!(
         "{mesh_threads} threads meshed {} sections in {:.1} ms of wall time: {:.0} sections/s",
         regions.len(),
@@ -234,7 +256,7 @@ fn main() -> Result<(), Error> {
     Ok(())
 }
 
-fn mesher<'a>(context: &'a WorkerContext, seed: i64) -> Mesher<'a> {
+fn mesher<'a>(context: &'a WorkerContext, seed: i64, leaf_culling: LeafCullingMode) -> Mesher<'a> {
     Mesher {
         nether_shading: false,
         shader_pack_lighting: false,
@@ -247,7 +269,7 @@ fn mesher<'a>(context: &'a WorkerContext, seed: i64) -> Mesher<'a> {
         cutout_leaves: true,
         opaque_ice: false,
         translucent_layers: &[],
-        leaf_culling: LeafCullingMode::Off,
+        leaf_culling,
         hidden_states: &[],
         part_tables: Default::default(),
         assets: &context.assets,
@@ -274,8 +296,9 @@ fn mesh_rounds(
     seed: i64,
     regions: &[(Region, i32)],
     rounds: usize,
+    leaf_culling: LeafCullingMode,
 ) -> Result<Rounds, Error> {
-    let mut mesher = mesher(context, seed);
+    let mut mesher = mesher(context, seed, leaf_culling);
     let mut scratch = MeshScratch::default();
     let mut recycled = SectionMesh::default();
     let mut per_section = vec![Duration::MAX; regions.len()];
@@ -312,13 +335,14 @@ fn mesh_parallel(
     seed: i64,
     regions: &[(Region, i32)],
     threads: usize,
+    leaf_culling: LeafCullingMode,
 ) -> Result<Duration, Error> {
     let next = AtomicUsize::new(0);
     let started = Instant::now();
     thread::scope(|scope| {
         for _ in 0..threads.max(1) {
             scope.spawn(|| {
-                let mut mesher = mesher(context, seed);
+                let mut mesher = mesher(context, seed, leaf_culling);
                 let mut scratch = MeshScratch::default();
                 let mut recycled = SectionMesh::default();
                 loop {

@@ -16,20 +16,30 @@
 //! those whose faced leaf has another leaf or an opaque cube behind it
 //! ([`backed`]), so the layer seen through the canopy's outer holes stays.
 
-use super::{B, Info, P, Padded, pi};
+use super::{B, P, Padded, StateFlags, pi};
 use crate::{blocks::RenderShape, chunk::Chunk, graphics::LeafCullingMode};
 
+const _: () = assert!(B == 2);
+
 /// A cell of the padded snapshot, as far as leaf culling cares.
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Cell {
     /// Air, a fluid, a partial model, glass or any other non-occluding block.
-    Open,
+    Open = 0,
     /// `LeavesBlock`.
-    Leaf,
+    Leaf = 1,
     /// A full opaque cube (see [`opaque_cube`]).
-    Opaque,
+    Opaque = 2,
     /// Missing chunk, missing section or the mask's outer shell.
-    Unknown,
+    Unknown = 3,
+}
+
+#[inline]
+fn classify(flags: &[StateFlags], id: u32) -> Cell {
+    flags
+        .get(id as usize)
+        .map_or(Cell::Unknown, |f| f.leaf_cell())
 }
 
 /// Whether a state is a full opaque cube: `RenderShape::Model`, `can_occlude`,
@@ -65,59 +75,140 @@ pub(super) struct LeafMask {
 }
 
 impl LeafMask {
+    /// Marks the mask inactive without releasing its scratch buffers.
+    #[inline]
+    pub(super) fn deactivate(&mut self) {
+        self.active = false;
+    }
+
     /// Classify the padded snapshot and, for the interior modes, measure how
     /// deep each leaf sits below the canopy surface.
+    ///
+    /// When `assume_leaves` is true (the caller already verified the section's
+    /// palette contains a leaf state), the preliminary 4,096-cell scan is
+    /// skipped and center-leaf presence is tracked during classification.
     pub(super) fn prepare(
         &mut self,
         mode: LeafCullingMode,
         pad: &Padded,
-        info: &[Info],
+        flags: &[StateFlags],
         region: &[[Option<&Chunk>; 3]; 3],
         base_y: i32,
+        assume_leaves: bool,
     ) {
         self.active = mode != LeafCullingMode::Off;
         if !self.active {
             return;
         }
-        // Most sections hold no leaves at all; do not classify 8,000 cells to
-        // learn that. The centre is the only part this mesh can change.
-        let mut leaves = false;
-        'scan: for y in 0..16 {
-            for z in 0..16 {
-                for x in 0..16 {
-                    if info
-                        .get(pad.blocks[pi(x, y, z)] as usize)
-                        .is_some_and(|state| state.leaves)
-                    {
-                        leaves = true;
-                        break 'scan;
+        // Most sections hold no leaves at all; when the caller could not rule
+        // them out via the palette, scan the centre before classifying the halo.
+        if !assume_leaves {
+            let mut leaves = false;
+            'scan: for y in 0..16 {
+                for z in 0..16 {
+                    let row = pi(0, y, z);
+                    for &id in &pad.blocks[row..row + 16] {
+                        if flags.get(id as usize).is_some_and(|f| f.is_leaf()) {
+                            leaves = true;
+                            break 'scan;
+                        }
                     }
                 }
             }
+            if !leaves {
+                self.active = false;
+                return;
+            }
         }
-        if !leaves {
-            self.active = false;
-            return;
-        }
+        // Initialize the outer shell (`-B` and `16 + B - 1`) to `Cell::Unknown`
+        // once; `Solid` writes only `0..16` (leaving `-1`/`16` untouched because
+        // `Solid` never reads them), and the general path below (`SolidAggressive`
+        // in production, plus `Hollow` in tests) writes all of `-1..=16`.
         if self.cells.len() != P * P * P {
-            self.cells.resize(P * P * P, Cell::Open);
+            self.cells.resize(P * P * P, Cell::Unknown);
         }
-        for y in -B..16 + B {
-            for z in -B..16 + B {
-                for x in -B..16 + B {
-                    let i = pi(x, y, z);
-                    self.cells[i] = if !known(region, base_y, x, y, z) {
-                        Cell::Unknown
-                    } else {
-                        match info.get(pad.blocks[i] as usize) {
-                            None => Cell::Unknown,
-                            Some(state) if state.leaves => Cell::Leaf,
-                            Some(state) if state.opaque_cube => Cell::Opaque,
-                            Some(_) => Cell::Open,
+        if mode == LeafCullingMode::Solid {
+            // `Solid` never runs `depths()`, only accepts `x, y, z in 1..15`,
+            // and only reads their six neighbours in `0..16` (all inside the
+            // centre chunk `region[1][1]`).
+            let center = region[1][1];
+            let mut any_center_leaf = !assume_leaves;
+            for y in 0..16 {
+                let known_center = center.is_some_and(|c| c.section_index(base_y + y).is_some());
+                if !known_center {
+                    for z in 0..16 {
+                        let row = pi(0, y, z);
+                        self.cells[row..row + 16].fill(Cell::Unknown);
+                    }
+                    continue;
+                }
+                for z in 0..16 {
+                    let row = pi(0, y, z);
+                    let dst = &mut self.cells[row..row + 16];
+                    let src = &pad.blocks[row..row + 16];
+                    if assume_leaves {
+                        for (cell, &id) in dst.iter_mut().zip(src) {
+                            let c = classify(flags, id);
+                            any_center_leaf |= c == Cell::Leaf;
+                            *cell = c;
                         }
-                    };
+                    } else {
+                        for (cell, &id) in dst.iter_mut().zip(src) {
+                            *cell = classify(flags, id);
+                        }
+                    }
                 }
             }
+            if !any_center_leaf {
+                self.active = false;
+            }
+            return;
+        }
+        let mut any_center_leaf = !assume_leaves;
+        for y in -1..=16 {
+            let wy = base_y + y;
+            let known_layer: [[bool; 3]; 3] = std::array::from_fn(|rz| {
+                std::array::from_fn(|rx| {
+                    region[rz][rx].is_some_and(|chunk| chunk.section_index(wy).is_some())
+                })
+            });
+            let inner_y = (0..16).contains(&y);
+            for z in -1..=16 {
+                let rz = ((z + 16) >> 4) as usize;
+                let [k_west, k_mid, k_east] = known_layer[rz];
+                let row = pi(-1, y, z);
+                self.cells[row] = if k_west {
+                    classify(flags, pad.blocks[row])
+                } else {
+                    Cell::Unknown
+                };
+                let mid_cells = &mut self.cells[row + 1..row + 17];
+                if k_mid {
+                    let mid_blocks = &pad.blocks[row + 1..row + 17];
+                    if assume_leaves && inner_y && (0..16).contains(&z) {
+                        for (cell, &id) in mid_cells.iter_mut().zip(mid_blocks) {
+                            let c = classify(flags, id);
+                            any_center_leaf |= c == Cell::Leaf;
+                            *cell = c;
+                        }
+                    } else {
+                        for (cell, &id) in mid_cells.iter_mut().zip(mid_blocks) {
+                            *cell = classify(flags, id);
+                        }
+                    }
+                } else {
+                    mid_cells.fill(Cell::Unknown);
+                }
+                self.cells[row + 17] = if k_east {
+                    classify(flags, pad.blocks[row + 17])
+                } else {
+                    Cell::Unknown
+                };
+            }
+        }
+        if !any_center_leaf {
+            self.active = false;
+            return;
         }
         // Solid is a purely local six-neighbour test. Reserve the breadth-first
         // search for Solid Aggressive, whose one-open-side rule needs to know
@@ -137,9 +228,11 @@ impl LeafMask {
             self.depth.fill(UNVISITED);
         }
         self.queue.clear();
-        for y in -B..16 + B {
-            for z in -B..16 + B {
-                for x in -B..16 + B {
+        // The outer shell (`-B` and `16 + B - 1`) is always `Cell::Unknown`,
+        // so only `-1..=16` can hold leaves.
+        for y in -1..=16 {
+            for z in -1..=16 {
+                for x in -1..=16 {
                     let i = pi(x, y, z);
                     if self.cells[i] != Cell::Leaf {
                         continue;
@@ -236,13 +329,14 @@ pub(super) fn in_section(x: i32, y: i32, z: i32) -> bool {
 #[inline]
 pub(super) fn backed(
     pad: &Padded,
-    info: &[Info],
+    flags: &[StateFlags],
     region: &[[Option<&Chunk>; 3]; 3],
     base_y: i32,
     [x, y, z]: [i32; 3],
 ) -> bool {
-    info.get(pad.blocks[pi(x, y, z)] as usize)
-        .is_some_and(|state| state.leaves || state.opaque_cube)
+    flags
+        .get(pad.blocks[pi(x, y, z)] as usize)
+        .is_some_and(|f| f.is_leaf_or_opaque())
         && known(region, base_y, x, y, z)
 }
 
@@ -261,6 +355,11 @@ fn known(region: &[[Option<&Chunk>; 3]; 3], base_y: i32, x: i32, y: i32, z: i32)
 
 #[cfg(test)]
 impl LeafMask {
+    #[inline]
+    pub(super) fn is_active(&self) -> bool {
+        self.active
+    }
+
     /// Whether `Hollow` drops the face of the leaf at `(x, y, z)` toward `d`.
     /// Only a known leaf on the other side counts: open cells, partial models,
     /// missing neighbours and the mask's edge stay visible.
@@ -315,6 +414,7 @@ fn unpi(i: usize) -> (i32, i32, i32) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::Info;
     use super::*;
     use crate::{blocks::RenderShape, graphics::LeafCullingMode};
     use horizon_core::geometry::Direction;
@@ -352,13 +452,13 @@ mod tests {
     }
 
     /// State 0 is air, 1 leaves, 2 a full opaque cube, 3 a partial model.
-    fn states() -> Vec<Info> {
-        vec![
+    fn states() -> Vec<StateFlags> {
+        StateFlags::build_table(&[
             info(false, false),
             info(true, false),
             info(false, true),
             info(false, false),
-        ]
+        ])
     }
 
     fn padded(fill: impl Fn(i32, i32, i32) -> u32) -> Padded {
@@ -391,9 +491,14 @@ mod tests {
         [[Some(chunk); 3]; 3]
     }
 
-    fn built(mode: LeafCullingMode, pad: &Padded, states: &[Info], chunk: &Chunk) -> LeafMask {
+    fn built(
+        mode: LeafCullingMode,
+        pad: &Padded,
+        states: &[StateFlags],
+        chunk: &Chunk,
+    ) -> LeafMask {
         let mut mask = LeafMask::default();
-        mask.prepare(mode, pad, states, &region(chunk), 0);
+        mask.prepare(mode, pad, states, &region(chunk), 0, false);
         mask
     }
 
@@ -578,7 +683,7 @@ mod tests {
         let mut around = [[Some(&chunk); 3]; 3];
         around[1][2] = None; // east chunk
         let mut mask = LeafMask::default();
-        mask.prepare(LeafCullingMode::Hollow, &pad, &states, &around, 0);
+        mask.prepare(LeafCullingMode::Hollow, &pad, &states, &around, 0, false);
         // The leaf at the edge keeps its face toward the missing chunk, even
         // though `Padded::fill` copied the centre's edge leaf there.
         assert!(!mask.hides_face(LeafCullingMode::Hollow, 15, 8, 8, Direction::East));
@@ -589,12 +694,26 @@ mod tests {
         // section up has no data, so it can never be interior.
         let short = Chunk::with_layout(0, 0, crate::chunk::ColumnLayout::new(0, 16).unwrap());
         let mut mask = LeafMask::default();
-        mask.prepare(LeafCullingMode::Solid, &pad, &states, &region(&short), 16);
+        mask.prepare(
+            LeafCullingMode::Solid,
+            &pad,
+            &states,
+            &region(&short),
+            16,
+            false,
+        );
         assert!(!mask.interior(LeafCullingMode::Solid, 8, 8, 8));
 
         // The outer shell has no data beyond it.
         let mut mask = LeafMask::default();
-        mask.prepare(LeafCullingMode::Hollow, &pad, &states, &region(&chunk), 0);
+        mask.prepare(
+            LeafCullingMode::Hollow,
+            &pad,
+            &states,
+            &region(&chunk),
+            0,
+            false,
+        );
         assert_eq!(mask.cell(-B, 0, 0), Cell::Unknown);
         assert_eq!(mask.cell(16 + B - 1, 0, 0), Cell::Unknown);
         assert_eq!(mask.cell(0, 0, 0), Cell::Leaf);
@@ -602,7 +721,14 @@ mod tests {
         // A section boundary is never enclosed, even with every chunk loaded:
         // the neighbouring section may not have been meshed yet.
         let mut mask = LeafMask::default();
-        mask.prepare(LeafCullingMode::Solid, &pad, &states, &region(&chunk), 0);
+        mask.prepare(
+            LeafCullingMode::Solid,
+            &pad,
+            &states,
+            &region(&chunk),
+            0,
+            false,
+        );
         assert!(!mask.interior(LeafCullingMode::Solid, 15, 8, 8));
         assert!(mask.interior(LeafCullingMode::Solid, 14, 8, 8));
     }
@@ -614,7 +740,14 @@ mod tests {
         cube(&mut pad, 7, 9, 1);
         let chunk = loaded();
         let mut mask = LeafMask::default();
-        mask.prepare(LeafCullingMode::Off, &pad, &states, &region(&chunk), 0);
+        mask.prepare(
+            LeafCullingMode::Off,
+            &pad,
+            &states,
+            &region(&chunk),
+            0,
+            false,
+        );
         assert!(!mask.active);
         assert!(mask.cells.is_empty());
         assert!(!mask.interior(LeafCullingMode::Off, 8, 8, 8));
@@ -634,13 +767,101 @@ mod tests {
             &states,
             &region(&chunk),
             0,
+            false,
         );
         assert_eq!(mask.cell(8, 8, 8), Cell::Leaf);
         let mut other = padded(|_, _, _| 0);
         cube(&mut other, 10, 12, 1);
-        mask.prepare(LeafCullingMode::Hollow, &other, &states, &region(&chunk), 0);
+        mask.prepare(
+            LeafCullingMode::Hollow,
+            &other,
+            &states,
+            &region(&chunk),
+            0,
+            false,
+        );
         assert_eq!(mask.cell(8, 8, 8), Cell::Open);
         assert_eq!(mask.cell(11, 11, 11), Cell::Leaf);
+    }
+
+    #[test]
+    fn state_flags_leaf_cell_prefers_leaf_and_stale_palette_deactivates() {
+        // When both `leaves` and `opaque_cube` are set, `leaf_cell` matches the
+        // original priority order and classifies as `Cell::Leaf`.
+        assert_eq!(
+            StateFlags::from_info(&info(true, true)).leaf_cell(),
+            Cell::Leaf
+        );
+        assert_eq!(
+            StateFlags::from_info(&info(false, true)).leaf_cell(),
+            Cell::Opaque
+        );
+        assert_eq!(
+            StateFlags::from_info(&info(false, false)).leaf_cell(),
+            Cell::Open
+        );
+
+        let states = states();
+        let chunk = loaded();
+        let mut leaf_pad = padded(|_, _, _| 0);
+        cube(&mut leaf_pad, 7, 9, 1);
+        let stone_pad = padded(|_, _, _| 2);
+
+        for mode in [LeafCullingMode::Solid, LeafCullingMode::SolidAggressive] {
+            let mut mask = LeafMask::default();
+            mask.prepare(mode, &leaf_pad, &states, &region(&chunk), 0, true);
+            assert!(mask.active, "{mode:?}");
+            assert!(mask.interior(mode, 8, 8, 8), "{mode:?}");
+
+            // Stale leaf palette entry (`assume_leaves = true` with no leaves in
+            // the centre) deactivates the mask without leaking the prior section.
+            mask.prepare(mode, &stone_pad, &states, &region(&chunk), 0, true);
+            assert!(!mask.active, "{mode:?}");
+            assert!(!mask.interior(mode, 8, 8, 8), "{mode:?}");
+
+            // Re-activating and then calling `deactivate()` clears `active`.
+            mask.prepare(mode, &leaf_pad, &states, &region(&chunk), 0, true);
+            assert!(mask.active, "{mode:?}");
+            assert_eq!(mask.cell(-B, 0, 0), Cell::Unknown, "{mode:?}");
+            assert_eq!(mask.cell(16 + B - 1, 0, 0), Cell::Unknown, "{mode:?}");
+            mask.deactivate();
+            assert!(!mask.active, "{mode:?}");
+            assert!(!mask.interior(mode, 8, 8, 8), "{mode:?}");
+        }
+
+        // Switching SolidAggressive -> Solid -> SolidAggressive preserves the
+        // outer shell `Unknown` invariant and reclassifies correctly.
+        let mut mask = LeafMask::default();
+        mask.prepare(
+            LeafCullingMode::SolidAggressive,
+            &leaf_pad,
+            &states,
+            &region(&chunk),
+            0,
+            true,
+        );
+        mask.prepare(
+            LeafCullingMode::Solid,
+            &leaf_pad,
+            &states,
+            &region(&chunk),
+            0,
+            true,
+        );
+        assert_eq!(mask.cell(-B, 0, 0), Cell::Unknown);
+        assert_eq!(mask.cell(16 + B - 1, 0, 0), Cell::Unknown);
+        assert!(mask.interior(LeafCullingMode::Solid, 8, 8, 8));
+        assert!(!mask.interior(LeafCullingMode::Solid, 7, 8, 8));
+        mask.prepare(
+            LeafCullingMode::SolidAggressive,
+            &leaf_pad,
+            &states,
+            &region(&chunk),
+            0,
+            true,
+        );
+        assert_eq!(mask.cell(-B, 0, 0), Cell::Unknown);
+        assert!(mask.interior(LeafCullingMode::SolidAggressive, 7, 8, 8));
     }
 
     #[test]
@@ -663,7 +884,7 @@ mod tests {
             let mut mask = LeafMask::default();
             let started = Instant::now();
             for _ in 0..iterations {
-                mask.prepare(mode, &pad, &states, &region, 0);
+                mask.prepare(mode, &pad, &states, &region, 0, true);
             }
             let per = started.elapsed() / iterations;
             println!("leaf mask {mode:?}: {per:?} per section ({iterations} iterations)");
