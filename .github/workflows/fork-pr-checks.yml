@@ -83,7 +83,7 @@ env:
   CARGO_INCREMENTAL: "0"
   SCCACHE_VERSION: "v0.20.1"
   SCCACHE_SHA256: "c9f6c5a3ae84d9da0956b28c357a365827bda33f3383647fc0b67484c74a5ea9"
-  SCCACHE_CACHE_SIZE: "2G"
+  SCCACHE_CACHE_SIZE: "1.5G"
   SCCACHE_CACHE_ZSTD_LEVEL: "6"
   SCCACHE_IDLE_TIMEOUT: "0"
   SCCACHE_BASEDIRS_VERBATIM_ENV_DEPS: "CARGO_MANIFEST_DIR,CARGO_MANIFEST_PATH"
@@ -598,6 +598,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install Rust toolchain and Linux build dependencies
+        id: rust_setup
         env:
           NEED_LAUNCHER: ${{ needs.scope.outputs.launcher }}
         run: |
@@ -630,10 +631,11 @@ jobs:
           tar -xzf "$sccache_tgz" --strip-components=1 -C /tmp "sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache"
           sudo install -m 0755 /tmp/sccache /usr/local/bin/sccache
           rm -f "$sccache_tgz" /tmp/sccache
+          echo "rustc_hash=$(rustc -vV | sha256sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
           mkdir -p "$RUNNER_TEMP/sccache"
           {
             echo "SCCACHE_DIR=$RUNNER_TEMP/sccache"
-            echo "SCCACHE_BASEDIRS=$GITHUB_WORKSPACE"
+            echo "SCCACHE_BASEDIRS=$GITHUB_WORKSPACE/target:$GITHUB_WORKSPACE"
             if [ -x "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh" ]; then
               echo "RUSTC_WRAPPER=$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
             else
@@ -642,15 +644,17 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Restore sccache archive
+        if: needs.scope.outputs.rust == 'true'
         id: restore_sccache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/sccache
-          key: fork-sccache-v1-${{ needs.scope.outputs.base_sha }}
+          key: fork-sccache-v1-${{ steps.rust_setup.outputs.rustc_hash }}-${{ hashFiles('Cargo.lock', 'launcher/Cargo.lock') }}
           restore-keys: |
-            fork-sccache-v1-
+            fork-sccache-v1-${{ steps.rust_setup.outputs.rustc_hash }}-
 
       - name: Cache Cargo registry and build dependencies
+        if: needs.scope.outputs.rust == 'true'
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: fork-pr-checks-tests-v3
@@ -668,6 +672,7 @@ jobs:
           save-if: ${{ needs.scope.outputs.launcher == 'true' }}
 
       - name: Run tools/pr_ready.py
+        id: run_pr_ready
         env:
           BASE_REF: ${{ needs.scope.outputs.base_ref }}
           BASE_SHA: ${{ needs.scope.outputs.base_sha }}
@@ -716,15 +721,17 @@ jobs:
       - name: Print sccache stats and stop server
         if: always()
         run: |
+          command -v sccache >/dev/null 2>&1 || exit 0
           sccache --show-stats || true
           sccache --stop-server || true
 
       - name: Save sccache archive
-        if: always() && needs.scope.outputs.rust == 'true' && steps.restore_sccache.outputs.cache-hit != 'true'
+        if: (success() || failure()) && needs.scope.outputs.rust == 'true' && steps.restore_sccache.outcome == 'success' && steps.restore_sccache.outputs.cache-hit != 'true' && steps.run_pr_ready.outcome != 'skipped'
+        continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/sccache
-          key: fork-sccache-v1-${{ needs.scope.outputs.base_sha }}
+          key: fork-sccache-v1-${{ steps.rust_setup.outputs.rustc_hash }}-${{ hashFiles('Cargo.lock', 'launcher/Cargo.lock') }}
 
       - name: Upload pr_ready summary artifact
         if: always()
@@ -781,6 +788,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain and Linux build dependencies
+        id: rust_setup
         run: |
           set -euo pipefail
           if [ -f tools/ci/install_rust.sh ]; then
@@ -799,10 +807,11 @@ jobs:
           tar -xzf "$sccache_tgz" --strip-components=1 -C /tmp "sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache"
           sudo install -m 0755 /tmp/sccache /usr/local/bin/sccache
           rm -f "$sccache_tgz" /tmp/sccache
+          echo "rustc_hash=$(rustc -vV | sha256sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
           mkdir -p "$RUNNER_TEMP/sccache"
           {
             echo "SCCACHE_DIR=$RUNNER_TEMP/sccache"
-            echo "SCCACHE_BASEDIRS=$GITHUB_WORKSPACE"
+            echo "SCCACHE_BASEDIRS=$GITHUB_WORKSPACE/target:$GITHUB_WORKSPACE"
             if [ -x "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh" ]; then
               echo "RUSTC_WRAPPER=$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
             else
@@ -814,9 +823,9 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/sccache
-          key: fork-sccache-v1-${{ needs.scope.outputs.base_sha }}
+          key: fork-sccache-v1-${{ steps.rust_setup.outputs.rustc_hash }}-${{ hashFiles('Cargo.lock', 'launcher/Cargo.lock') }}
           restore-keys: |
-            fork-sccache-v1-
+            fork-sccache-v1-${{ steps.rust_setup.outputs.rustc_hash }}-
 
       - name: Cache clippy Cargo dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -841,6 +850,7 @@ jobs:
       - name: Print sccache stats and stop server
         if: always()
         run: |
+          command -v sccache >/dev/null 2>&1 || exit 0
           sccache --show-stats || true
           sccache --stop-server || true
 
@@ -893,6 +903,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain and Linux build dependencies
+        id: rust_setup
         run: |
           set -euo pipefail
           scratch="$RUNNER_TEMP/horizon-scratch"
@@ -919,10 +930,11 @@ jobs:
           tar -xzf "$sccache_tgz" --strip-components=1 -C /tmp "sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache"
           sudo install -m 0755 /tmp/sccache /usr/local/bin/sccache
           rm -f "$sccache_tgz" /tmp/sccache
+          echo "rustc_hash=$(rustc -vV | sha256sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
           mkdir -p "$RUNNER_TEMP/sccache"
           {
             echo "SCCACHE_DIR=$RUNNER_TEMP/sccache"
-            echo "SCCACHE_BASEDIRS=$GITHUB_WORKSPACE"
+            echo "SCCACHE_BASEDIRS=$GITHUB_WORKSPACE/target:$GITHUB_WORKSPACE"
             if [ -x "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh" ]; then
               echo "RUSTC_WRAPPER=$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
             else
@@ -935,18 +947,19 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/sccache
-          key: fork-sccache-v1-${{ needs.scope.outputs.base_sha }}
+          key: fork-sccache-v1-${{ steps.rust_setup.outputs.rustc_hash }}-${{ hashFiles('Cargo.lock', 'launcher/Cargo.lock') }}
           restore-keys: |
-            fork-sccache-v1-
+            fork-sccache-v1-${{ steps.rust_setup.outputs.rustc_hash }}-
 
       - name: Cache tests Cargo dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: fork-pr-checks-tests-v3
           cache-on-failure: true
-          save-if: ${{ inputs.mode == 'verify' }}
+          save-if: ${{ inputs.mode == 'verify' && inputs.crates == '' && inputs.test_filter == '' && needs.scope.outputs.touched_crates == '__WORKSPACE__' }}
 
       - name: Run check and tests
+        id: run_tests
         env:
           INPUT_MODE: ${{ inputs.mode }}
           INPUT_CRATES: ${{ inputs.crates }}
@@ -1082,15 +1095,17 @@ jobs:
       - name: Print sccache stats and stop server
         if: always()
         run: |
+          command -v sccache >/dev/null 2>&1 || exit 0
           sccache --show-stats || true
           sccache --stop-server || true
 
       - name: Save sccache archive
-        if: always() && inputs.mode == 'verify' && steps.restore_sccache.outputs.cache-hit != 'true'
+        if: (success() || failure()) && inputs.mode == 'verify' && inputs.crates == '' && inputs.test_filter == '' && needs.scope.outputs.touched_crates == '__WORKSPACE__' && steps.restore_sccache.outcome == 'success' && steps.restore_sccache.outputs.cache-hit != 'true' && steps.run_tests.outcome != 'skipped'
+        continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/sccache
-          key: fork-sccache-v1-${{ needs.scope.outputs.base_sha }}
+          key: fork-sccache-v1-${{ steps.rust_setup.outputs.rustc_hash }}-${{ hashFiles('Cargo.lock', 'launcher/Cargo.lock') }}
 
   launcher:
     name: "Launcher (verify)"
@@ -1138,6 +1153,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain and launcher dependencies
+        id: rust_setup
         run: |
           set -euo pipefail
           scratch="$RUNNER_TEMP/horizon-launcher-scratch"
@@ -1171,10 +1187,11 @@ jobs:
           tar -xzf "$sccache_tgz" --strip-components=1 -C /tmp "sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache"
           sudo install -m 0755 /tmp/sccache /usr/local/bin/sccache
           rm -f "$sccache_tgz" /tmp/sccache
+          echo "rustc_hash=$(rustc -vV | sha256sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
           mkdir -p "$RUNNER_TEMP/sccache"
           {
             echo "SCCACHE_DIR=$RUNNER_TEMP/sccache"
-            echo "SCCACHE_BASEDIRS=$GITHUB_WORKSPACE"
+            echo "SCCACHE_BASEDIRS=$GITHUB_WORKSPACE/target:$GITHUB_WORKSPACE"
             if [ -x "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh" ]; then
               echo "RUSTC_WRAPPER=$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
             else
@@ -1186,9 +1203,9 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/sccache
-          key: fork-sccache-v1-${{ needs.scope.outputs.base_sha }}
+          key: fork-sccache-v1-${{ steps.rust_setup.outputs.rustc_hash }}-${{ hashFiles('Cargo.lock', 'launcher/Cargo.lock') }}
           restore-keys: |
-            fork-sccache-v1-
+            fork-sccache-v1-${{ steps.rust_setup.outputs.rustc_hash }}-
 
       - name: Cache launcher workspace dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -1214,6 +1231,7 @@ jobs:
       - name: Print sccache stats and stop server
         if: always()
         run: |
+          command -v sccache >/dev/null 2>&1 || exit 0
           sccache --show-stats || true
           sccache --stop-server || true
 
@@ -1266,6 +1284,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain and Linux build dependencies
+        id: rust_setup
         run: |
           set -euo pipefail
           if [ -f tools/ci/install_rust.sh ]; then
@@ -1284,10 +1303,11 @@ jobs:
           tar -xzf "$sccache_tgz" --strip-components=1 -C /tmp "sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache"
           sudo install -m 0755 /tmp/sccache /usr/local/bin/sccache
           rm -f "$sccache_tgz" /tmp/sccache
+          echo "rustc_hash=$(rustc -vV | sha256sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
           mkdir -p "$RUNNER_TEMP/sccache"
           {
             echo "SCCACHE_DIR=$RUNNER_TEMP/sccache"
-            echo "SCCACHE_BASEDIRS=$GITHUB_WORKSPACE/target/mod-api-base:$GITHUB_WORKSPACE"
+            echo "SCCACHE_BASEDIRS=$GITHUB_WORKSPACE/target/mod-api-base:$GITHUB_WORKSPACE/target:$GITHUB_WORKSPACE"
             if [ -x "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh" ]; then
               echo "RUSTC_WRAPPER=$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
             else
@@ -1299,9 +1319,9 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/sccache
-          key: fork-sccache-v1-${{ needs.scope.outputs.base_sha }}
+          key: fork-sccache-v1-${{ steps.rust_setup.outputs.rustc_hash }}-${{ hashFiles('Cargo.lock', 'launcher/Cargo.lock') }}
           restore-keys: |
-            fork-sccache-v1-
+            fork-sccache-v1-${{ steps.rust_setup.outputs.rustc_hash }}-
 
       - name: Restore tests Cargo cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -1335,6 +1355,7 @@ jobs:
       - name: Print sccache stats and stop server
         if: always()
         run: |
+          command -v sccache >/dev/null 2>&1 || exit 0
           sccache --show-stats || true
           sccache --stop-server || true
 
@@ -1384,6 +1405,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain and Linux build dependencies
+        id: rust_setup
         run: |
           set -euo pipefail
           if [ -f tools/ci/install_rust.sh ]; then
@@ -1402,10 +1424,11 @@ jobs:
           tar -xzf "$sccache_tgz" --strip-components=1 -C /tmp "sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache"
           sudo install -m 0755 /tmp/sccache /usr/local/bin/sccache
           rm -f "$sccache_tgz" /tmp/sccache
+          echo "rustc_hash=$(rustc -vV | sha256sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
           mkdir -p "$RUNNER_TEMP/sccache"
           {
             echo "SCCACHE_DIR=$RUNNER_TEMP/sccache"
-            echo "SCCACHE_BASEDIRS=$GITHUB_WORKSPACE"
+            echo "SCCACHE_BASEDIRS=$GITHUB_WORKSPACE/target:$GITHUB_WORKSPACE"
             if [ -x "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh" ]; then
               echo "RUSTC_WRAPPER=$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
             else
@@ -1417,9 +1440,9 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/sccache
-          key: fork-sccache-v1-${{ needs.scope.outputs.base_sha }}
+          key: fork-sccache-v1-${{ steps.rust_setup.outputs.rustc_hash }}-${{ hashFiles('Cargo.lock', 'launcher/Cargo.lock') }}
           restore-keys: |
-            fork-sccache-v1-
+            fork-sccache-v1-${{ steps.rust_setup.outputs.rustc_hash }}-
 
       - name: Cache fast-profile Cargo dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -1436,5 +1459,6 @@ jobs:
       - name: Print sccache stats and stop server
         if: always()
         run: |
+          command -v sccache >/dev/null 2>&1 || exit 0
           sccache --show-stats || true
           sccache --stop-server || true
