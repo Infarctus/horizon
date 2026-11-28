@@ -83,7 +83,7 @@ env:
   CARGO_INCREMENTAL: "0"
   SCCACHE_VERSION: "v0.20.1"
   SCCACHE_SHA256: "c9f6c5a3ae84d9da0956b28c357a365827bda33f3383647fc0b67484c74a5ea9"
-  SCCACHE_CACHE_SIZE: "1.5G"
+  SCCACHE_CACHE_SIZE: "1536M"
   SCCACHE_CACHE_ZSTD_LEVEL: "6"
   SCCACHE_IDLE_TIMEOUT: "0"
   SCCACHE_BASEDIRS_VERBATIM_ENV_DEPS: "CARGO_MANIFEST_DIR,CARGO_MANIFEST_PATH"
@@ -719,14 +719,23 @@ jobs:
           exit "$status"
 
       - name: Print sccache stats and stop server
+        id: sccache_stats
         if: always()
         run: |
-          command -v sccache >/dev/null 2>&1 || exit 0
+          if ! command -v sccache >/dev/null 2>&1; then
+            echo "has_cache=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           sccache --show-stats || true
           sccache --stop-server || true
+          if [ -n "${SCCACHE_DIR:-}" ] && [ -d "$SCCACHE_DIR" ] && find "$SCCACHE_DIR" -mindepth 1 -maxdepth 2 -print -quit | grep -q .; then
+            echo "has_cache=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_cache=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Save sccache archive
-        if: (success() || failure()) && needs.scope.outputs.rust == 'true' && steps.restore_sccache.outcome == 'success' && steps.restore_sccache.outputs.cache-hit != 'true' && steps.run_pr_ready.outcome != 'skipped'
+        if: (success() || failure()) && needs.scope.outputs.rust == 'true' && steps.restore_sccache.outcome == 'success' && steps.restore_sccache.outputs.cache-hit != 'true' && steps.run_pr_ready.outcome != 'skipped' && steps.sccache_stats.outputs.has_cache == 'true'
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -848,11 +857,20 @@ jobs:
           exit "$rc"
 
       - name: Print sccache stats and stop server
+        id: sccache_stats
         if: always()
         run: |
-          command -v sccache >/dev/null 2>&1 || exit 0
+          if ! command -v sccache >/dev/null 2>&1; then
+            echo "has_cache=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           sccache --show-stats || true
           sccache --stop-server || true
+          if [ -n "${SCCACHE_DIR:-}" ] && [ -d "$SCCACHE_DIR" ] && find "$SCCACHE_DIR" -mindepth 1 -maxdepth 2 -print -quit | grep -q .; then
+            echo "has_cache=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_cache=false" >> "$GITHUB_OUTPUT"
+          fi
 
   tests:
     name: "Rust tests (${{ inputs.mode }})"
@@ -1093,14 +1111,23 @@ jobs:
           exit "$rc"
 
       - name: Print sccache stats and stop server
+        id: sccache_stats
         if: always()
         run: |
-          command -v sccache >/dev/null 2>&1 || exit 0
+          if ! command -v sccache >/dev/null 2>&1; then
+            echo "has_cache=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           sccache --show-stats || true
           sccache --stop-server || true
+          if [ -n "${SCCACHE_DIR:-}" ] && [ -d "$SCCACHE_DIR" ] && find "$SCCACHE_DIR" -mindepth 1 -maxdepth 2 -print -quit | grep -q .; then
+            echo "has_cache=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_cache=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Save sccache archive
-        if: (success() || failure()) && inputs.mode == 'verify' && inputs.crates == '' && inputs.test_filter == '' && needs.scope.outputs.touched_crates == '__WORKSPACE__' && steps.restore_sccache.outcome == 'success' && steps.restore_sccache.outputs.cache-hit != 'true' && steps.run_tests.outcome != 'skipped'
+        if: (success() || failure()) && inputs.mode == 'verify' && inputs.crates == '' && inputs.test_filter == '' && needs.scope.outputs.touched_crates == '__WORKSPACE__' && steps.restore_sccache.outcome == 'success' && steps.restore_sccache.outputs.cache-hit != 'true' && steps.run_tests.outcome != 'skipped' && steps.sccache_stats.outputs.has_cache == 'true'
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -1229,11 +1256,20 @@ jobs:
           cargo test --locked --lib --bins --tests
 
       - name: Print sccache stats and stop server
+        id: sccache_stats
         if: always()
         run: |
-          command -v sccache >/dev/null 2>&1 || exit 0
+          if ! command -v sccache >/dev/null 2>&1; then
+            echo "has_cache=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           sccache --show-stats || true
           sccache --stop-server || true
+          if [ -n "${SCCACHE_DIR:-}" ] && [ -d "$SCCACHE_DIR" ] && find "$SCCACHE_DIR" -mindepth 1 -maxdepth 2 -print -quit | grep -q .; then
+            echo "has_cache=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_cache=false" >> "$GITHUB_OUTPUT"
+          fi
 
   mod-api:
     name: "Mod API check"
@@ -1353,11 +1389,20 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Print sccache stats and stop server
+        id: sccache_stats
         if: always()
         run: |
-          command -v sccache >/dev/null 2>&1 || exit 0
+          if ! command -v sccache >/dev/null 2>&1; then
+            echo "has_cache=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           sccache --show-stats || true
           sccache --stop-server || true
+          if [ -n "${SCCACHE_DIR:-}" ] && [ -d "$SCCACHE_DIR" ] && find "$SCCACHE_DIR" -mindepth 1 -maxdepth 2 -print -quit | grep -q .; then
+            echo "has_cache=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_cache=false" >> "$GITHUB_OUTPUT"
+          fi
 
   build-fast:
     name: "Build horizon-game (--profile fast)"
@@ -1457,8 +1502,17 @@ jobs:
           cargo build --locked --profile fast -p horizon-game
 
       - name: Print sccache stats and stop server
+        id: sccache_stats
         if: always()
         run: |
-          command -v sccache >/dev/null 2>&1 || exit 0
+          if ! command -v sccache >/dev/null 2>&1; then
+            echo "has_cache=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           sccache --show-stats || true
           sccache --stop-server || true
+          if [ -n "${SCCACHE_DIR:-}" ] && [ -d "$SCCACHE_DIR" ] && find "$SCCACHE_DIR" -mindepth 1 -maxdepth 2 -print -quit | grep -q .; then
+            echo "has_cache=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_cache=false" >> "$GITHUB_OUTPUT"
+          fi
