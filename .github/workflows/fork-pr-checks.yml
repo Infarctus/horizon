@@ -81,9 +81,15 @@ env:
   WGPU_BACKEND: "dx12"
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  SCCACHE_VERSION: "v0.20.1"
+  SCCACHE_SHA256: "c9f6c5a3ae84d9da0956b28c357a365827bda33f3383647fc0b67484c74a5ea9"
+  SCCACHE_CACHE_SIZE: "2G"
+  SCCACHE_CACHE_ZSTD_LEVEL: "6"
+  SCCACHE_IDLE_TIMEOUT: "0"
+  SCCACHE_BASEDIRS_VERBATIM_ENV_DEPS: "CARGO_MANIFEST_DIR,CARGO_MANIFEST_PATH"
   # Keep Cargo.toml's [profile.dev] debug = "line-tables-only":
   # crash::tests::the_debug_crash_is_reported_as_vanillas requires line tables,
-  # and uniform debuginfo + RUSTFLAGS maximize Swatinem/rust-cache sharing across jobs.
+  # and uniform debuginfo + RUSTFLAGS maximize Swatinem/rust-cache + sccache sharing across jobs.
 
 jobs:
   scope:
@@ -618,11 +624,36 @@ jobs:
             rustup default stable
           fi
           echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
+          sccache_tgz="$RUNNER_TEMP/sccache.tar.gz"
+          curl -fsSL "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" -o "$sccache_tgz"
+          echo "${SCCACHE_SHA256}  ${sccache_tgz}" | sha256sum -c -
+          tar -xzf "$sccache_tgz" --strip-components=1 -C /tmp "sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache"
+          sudo install -m 0755 /tmp/sccache /usr/local/bin/sccache
+          rm -f "$sccache_tgz" /tmp/sccache
+          mkdir -p "$RUNNER_TEMP/sccache"
+          {
+            echo "SCCACHE_DIR=$RUNNER_TEMP/sccache"
+            echo "SCCACHE_BASEDIRS=$GITHUB_WORKSPACE"
+            if [ -x "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh" ]; then
+              echo "RUSTC_WRAPPER=$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
+            else
+              echo "RUSTC_WRAPPER=sccache"
+            fi
+          } >> "$GITHUB_ENV"
+
+      - name: Restore sccache archive
+        id: restore_sccache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: fork-sccache-v1-${{ needs.scope.outputs.base_sha }}
+          restore-keys: |
+            fork-sccache-v1-
 
       - name: Cache Cargo registry and build dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: fork-pr-checks-root-v2
+          shared-key: fork-pr-checks-tests-v3
           cache-on-failure: true
           save-if: ${{ needs.scope.outputs.rust == 'true' }}
 
@@ -631,7 +662,7 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: launcher
-          shared-key: fork-pr-checks-launcher-v2
+          shared-key: fork-pr-checks-launcher-v3
           cache-bin: false
           cache-on-failure: true
           save-if: ${{ needs.scope.outputs.launcher == 'true' }}
@@ -681,6 +712,19 @@ jobs:
           echo "=== Ready-to-paste PR Self-check block ==="
           cat "$summary_out"
           exit "$status"
+
+      - name: Print sccache stats and stop server
+        if: always()
+        run: |
+          sccache --show-stats || true
+          sccache --stop-server || true
+
+      - name: Save sccache archive
+        if: always() && needs.scope.outputs.rust == 'true' && steps.restore_sccache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: fork-sccache-v1-${{ needs.scope.outputs.base_sha }}
 
       - name: Upload pr_ready summary artifact
         if: always()
@@ -749,11 +793,35 @@ jobs:
             rustup default stable
           fi
           echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
+          sccache_tgz="$RUNNER_TEMP/sccache.tar.gz"
+          curl -fsSL "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" -o "$sccache_tgz"
+          echo "${SCCACHE_SHA256}  ${sccache_tgz}" | sha256sum -c -
+          tar -xzf "$sccache_tgz" --strip-components=1 -C /tmp "sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache"
+          sudo install -m 0755 /tmp/sccache /usr/local/bin/sccache
+          rm -f "$sccache_tgz" /tmp/sccache
+          mkdir -p "$RUNNER_TEMP/sccache"
+          {
+            echo "SCCACHE_DIR=$RUNNER_TEMP/sccache"
+            echo "SCCACHE_BASEDIRS=$GITHUB_WORKSPACE"
+            if [ -x "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh" ]; then
+              echo "RUSTC_WRAPPER=$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
+            else
+              echo "RUSTC_WRAPPER=sccache"
+            fi
+          } >> "$GITHUB_ENV"
 
-      - name: Cache shared root Cargo dependencies
+      - name: Restore sccache archive
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: fork-sccache-v1-${{ needs.scope.outputs.base_sha }}
+          restore-keys: |
+            fork-sccache-v1-
+
+      - name: Cache clippy Cargo dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: fork-pr-checks-root-v2
+          shared-key: fork-pr-checks-clippy-v3
           cache-on-failure: true
           save-if: true
 
@@ -769,6 +837,12 @@ jobs:
             cargo clippy --locked -p horizon-client -p horizon-game -p horizon-mod-host --no-default-features --all-targets -- -D warnings || rc=1
           fi
           exit "$rc"
+
+      - name: Print sccache stats and stop server
+        if: always()
+        run: |
+          sccache --show-stats || true
+          sccache --stop-server || true
 
   tests:
     name: "Rust tests (${{ inputs.mode }})"
@@ -839,11 +913,36 @@ jobs:
             rustup default stable
           fi
           echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
+          sccache_tgz="$RUNNER_TEMP/sccache.tar.gz"
+          curl -fsSL "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" -o "$sccache_tgz"
+          echo "${SCCACHE_SHA256}  ${sccache_tgz}" | sha256sum -c -
+          tar -xzf "$sccache_tgz" --strip-components=1 -C /tmp "sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache"
+          sudo install -m 0755 /tmp/sccache /usr/local/bin/sccache
+          rm -f "$sccache_tgz" /tmp/sccache
+          mkdir -p "$RUNNER_TEMP/sccache"
+          {
+            echo "SCCACHE_DIR=$RUNNER_TEMP/sccache"
+            echo "SCCACHE_BASEDIRS=$GITHUB_WORKSPACE"
+            if [ -x "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh" ]; then
+              echo "RUSTC_WRAPPER=$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
+            else
+              echo "RUSTC_WRAPPER=sccache"
+            fi
+          } >> "$GITHUB_ENV"
 
-      - name: Cache shared root Cargo dependencies
+      - name: Restore sccache archive
+        id: restore_sccache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: fork-sccache-v1-${{ needs.scope.outputs.base_sha }}
+          restore-keys: |
+            fork-sccache-v1-
+
+      - name: Cache tests Cargo dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: fork-pr-checks-root-v2
+          shared-key: fork-pr-checks-tests-v3
           cache-on-failure: true
           save-if: ${{ inputs.mode == 'verify' }}
 
@@ -980,6 +1079,19 @@ jobs:
 
           exit "$rc"
 
+      - name: Print sccache stats and stop server
+        if: always()
+        run: |
+          sccache --show-stats || true
+          sccache --stop-server || true
+
+      - name: Save sccache archive
+        if: always() && inputs.mode == 'verify' && steps.restore_sccache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: fork-sccache-v1-${{ needs.scope.outputs.base_sha }}
+
   launcher:
     name: "Launcher (verify)"
     needs: scope
@@ -1053,12 +1165,36 @@ jobs:
             rustup default stable
           fi
           echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
+          sccache_tgz="$RUNNER_TEMP/sccache.tar.gz"
+          curl -fsSL "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" -o "$sccache_tgz"
+          echo "${SCCACHE_SHA256}  ${sccache_tgz}" | sha256sum -c -
+          tar -xzf "$sccache_tgz" --strip-components=1 -C /tmp "sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache"
+          sudo install -m 0755 /tmp/sccache /usr/local/bin/sccache
+          rm -f "$sccache_tgz" /tmp/sccache
+          mkdir -p "$RUNNER_TEMP/sccache"
+          {
+            echo "SCCACHE_DIR=$RUNNER_TEMP/sccache"
+            echo "SCCACHE_BASEDIRS=$GITHUB_WORKSPACE"
+            if [ -x "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh" ]; then
+              echo "RUSTC_WRAPPER=$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
+            else
+              echo "RUSTC_WRAPPER=sccache"
+            fi
+          } >> "$GITHUB_ENV"
+
+      - name: Restore sccache archive
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: fork-sccache-v1-${{ needs.scope.outputs.base_sha }}
+          restore-keys: |
+            fork-sccache-v1-
 
       - name: Cache launcher workspace dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: launcher
-          shared-key: fork-pr-checks-launcher-v2
+          shared-key: fork-pr-checks-launcher-v3
           cache-bin: false
           cache-on-failure: true
           save-if: true
@@ -1074,6 +1210,12 @@ jobs:
             cargo clippy --locked --all-targets -- -D warnings
           fi
           cargo test --locked --lib --bins --tests
+
+      - name: Print sccache stats and stop server
+        if: always()
+        run: |
+          sccache --show-stats || true
+          sccache --stop-server || true
 
   mod-api:
     name: "Mod API check"
@@ -1136,11 +1278,35 @@ jobs:
             rustup default stable
           fi
           echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
+          sccache_tgz="$RUNNER_TEMP/sccache.tar.gz"
+          curl -fsSL "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" -o "$sccache_tgz"
+          echo "${SCCACHE_SHA256}  ${sccache_tgz}" | sha256sum -c -
+          tar -xzf "$sccache_tgz" --strip-components=1 -C /tmp "sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache"
+          sudo install -m 0755 /tmp/sccache /usr/local/bin/sccache
+          rm -f "$sccache_tgz" /tmp/sccache
+          mkdir -p "$RUNNER_TEMP/sccache"
+          {
+            echo "SCCACHE_DIR=$RUNNER_TEMP/sccache"
+            echo "SCCACHE_BASEDIRS=$GITHUB_WORKSPACE/target/mod-api-base:$GITHUB_WORKSPACE"
+            if [ -x "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh" ]; then
+              echo "RUSTC_WRAPPER=$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
+            else
+              echo "RUSTC_WRAPPER=sccache"
+            fi
+          } >> "$GITHUB_ENV"
 
-      - name: Restore shared root Cargo cache
+      - name: Restore sccache archive
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: fork-sccache-v1-${{ needs.scope.outputs.base_sha }}
+          restore-keys: |
+            fork-sccache-v1-
+
+      - name: Restore tests Cargo cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: fork-pr-checks-root-v2
+          shared-key: fork-pr-checks-tests-v3
           cache-on-failure: false
           save-if: false
 
@@ -1165,6 +1331,12 @@ jobs:
             fi
             echo "- \`tools/check_mod_api_unchanged.py --base ${MERGE_BASE:0:12} --allow-added\` (merge base with \`${BASE_REF}\`): passed"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Print sccache stats and stop server
+        if: always()
+        run: |
+          sccache --show-stats || true
+          sccache --stop-server || true
 
   build-fast:
     name: "Build horizon-game (--profile fast)"
@@ -1224,15 +1396,45 @@ jobs:
             rustup default stable
           fi
           echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
+          sccache_tgz="$RUNNER_TEMP/sccache.tar.gz"
+          curl -fsSL "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" -o "$sccache_tgz"
+          echo "${SCCACHE_SHA256}  ${sccache_tgz}" | sha256sum -c -
+          tar -xzf "$sccache_tgz" --strip-components=1 -C /tmp "sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache"
+          sudo install -m 0755 /tmp/sccache /usr/local/bin/sccache
+          rm -f "$sccache_tgz" /tmp/sccache
+          mkdir -p "$RUNNER_TEMP/sccache"
+          {
+            echo "SCCACHE_DIR=$RUNNER_TEMP/sccache"
+            echo "SCCACHE_BASEDIRS=$GITHUB_WORKSPACE"
+            if [ -x "$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh" ]; then
+              echo "RUSTC_WRAPPER=$GITHUB_WORKSPACE/tools/ci/compiler-cache.sh"
+            else
+              echo "RUSTC_WRAPPER=sccache"
+            fi
+          } >> "$GITHUB_ENV"
 
-      - name: Restore shared root Cargo cache
+      - name: Restore sccache archive
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: fork-sccache-v1-${{ needs.scope.outputs.base_sha }}
+          restore-keys: |
+            fork-sccache-v1-
+
+      - name: Cache fast-profile Cargo dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: fork-pr-checks-root-v2
-          cache-on-failure: false
-          save-if: false
+          shared-key: fork-pr-checks-fast-v3
+          cache-on-failure: true
+          save-if: true
 
       - name: Build horizon-game with --profile fast
         run: |
           set -euo pipefail
           cargo build --locked --profile fast -p horizon-game
+
+      - name: Print sccache stats and stop server
+        if: always()
+        run: |
+          sccache --show-stats || true
+          sccache --stop-server || true
